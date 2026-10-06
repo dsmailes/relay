@@ -1,0 +1,18 @@
+id = "community.harness-relay"
+name = "Harness Relay"
+version = "0.1.0"
+min_herdr_version = "0.7.3"
+description = "Plan, implement, and review a change across coding harnesses"
+platforms = ["linux", "macos", "windows"]
+
+[[actions]]
+id = "open-relay"
+title = "Start Harness Relay"
+contexts = ["workspace"]
+command = ["node", "src/open-relay.mjs"]
+
+[[panes]]
+id = "relay-console"
+title = "Harness Relay"
+placement = "tab"
+command = ["node", "src/relay-console.mjs"]
