@@ -137,6 +137,88 @@ function agentName(runId, slot) {
   return `relay_${runId.slice(0, 8)}_h${String(slot + 1).padStart(2, "0")}`;
 }
 
+function delay(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function livestockBoardPath(cwd) {
+  return path.join(cwd, ".herdr-issues.json");
+}
+
+async function loadBoard(cwd) {
+  const target = livestockBoardPath(cwd);
+  try {
+    const board = JSON.parse(await readFile(target, "utf8"));
+    if (!board || !Array.isArray(board.issues)) throw new Error("Livestock board must contain an issues array.");
+    return { target, board };
+  } catch (error) {
+    if (error.code === "ENOENT") return { target, board: { version: 1, issues: [] } };
+    throw error;
+  }
+}
+
+async function saveBoard(target, board) {
+  const temp = `${target}.${process.pid}.tmp`;
+  await writeFile(temp, `${JSON.stringify(board, null, 2)}\n`, { mode: 0o600 });
+  const { rename } = await import("node:fs/promises");
+  await rename(temp, target);
+}
+
+function newIssueId(issues) {
+  let id;
+  do { id = randomUUID().replaceAll("-", "").slice(0, 8); }
+  while (issues.some((issue) => issue.id === id));
+  return id;
+}
+
+async function createBoardTickets(state, tasks) {
+  const { target, board } = await loadBoard(state.cwd);
+  const timestamp = new Date().toISOString();
+  const parentId = newIssueId(board.issues);
+  const tag = `Harness Relay run ${state.runId}`;
+  const parent = {
+    id: parentId,
+    title: state.changeRequest.slice(0, 160),
+    status: "in progress",
+    priority: "normal",
+    notes: `${tag}\n\nThis issue tracks a multi-harness change. Child task tickets contain acceptance criteria and handoff notes.`,
+    blocked_by: [],
+    created_at: timestamp,
+    updated_at: timestamp,
+  };
+  board.issues.push(parent);
+  const ticketIds = [];
+  tasks.forEach((task, index) => {
+    const issueId = newIssueId(board.issues);
+    ticketIds.push(issueId);
+    board.issues.push({
+      id: issueId,
+      title: typeof task === "string" ? task : task.title,
+      status: "open",
+      priority: "normal",
+      notes: `${tag}\nParent issue: ${parentId}\n\nChange request:\n${state.changeRequest}\n\nAcceptance criteria:\n${typeof task === "string" ? task : task.acceptanceCriteria}\n\nTask ${index + 1} of ${tasks.length}.`,
+      blocked_by: [],
+      created_at: timestamp,
+      updated_at: timestamp,
+    });
+  });
+  await saveBoard(target, board);
+  state.livestock = { boardPath: target, parentTicketId: parentId, taskTicketIds: ticketIds };
+  await persist(state);
+  stdout.write(`Added a parent ticket and ${ticketIds.length} task ticket(s) to Livestock.\n`);
+}
+
+async function updateBoardTicket(state, issueId, { status, note } = {}) {
+  if (!state.livestock?.boardPath || !issueId) return;
+  const { board } = await loadBoard(state.cwd);
+  const issue = board.issues.find((entry) => entry.id === issueId);
+  if (!issue) throw new Error(`Livestock ticket ${issueId} is missing from ${state.livestock.boardPath}.`);
+  if (status) issue.status = status;
+  if (note) issue.notes = `${issue.notes || ""}${issue.notes ? "\n\n" : ""}[${new Date().toISOString()}] ${note}`;
+  issue.updated_at = new Date().toISOString();
+  await saveBoard(state.livestock.boardPath, board);
+}
+
 function extractMarker(text, prefix) {
   const escaped = prefix.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   const matches = [...text.matchAll(new RegExp(`^${escaped}\\s*(.+)$`, "gm"))];
@@ -148,15 +230,27 @@ function extractMarker(text, prefix) {
 async function runAgent(state, role, prompt, marker) {
   const slot = state.chainCursor;
   const kind = state.harnessChain[slot];
-  const paneId = state.panes[slot];
-  const name = state.agents[slot];
+  await ensureWorker(state, slot);
+  const name = state.activeAgentName;
   state.chainCursor = (slot + 1) % state.harnessChain.length;
   state.stage = `waiting:${role}`;
   state.lastPrompt = { role, harness: kind, chainSlot: slot, at: new Date().toISOString(), marker };
   await persist(state);
+  const activeTicketId = state.livestock?.taskTicketIds?.[state.taskIndex];
+  let handoffPrompt = prompt;
+  if (activeTicketId) {
+    await updateBoardTicket(state, activeTicketId, { note: `${role} handed the baton to ${kind}.` });
+    const { board } = await loadBoard(state.cwd);
+    const ticket = board.issues.find((issue) => issue.id === activeTicketId);
+    if (!ticket) throw new Error(`Livestock ticket ${activeTicketId} is missing from the board.`);
+    handoffPrompt = [
+      `Livestock ticket ${ticket.id}: ${ticket.title}\nStatus: ${ticket.status}\nPriority: ${ticket.priority}\nNotes and handoff history:\n${ticket.notes || "(none)"}`,
+      prompt,
+    ].join("\n\n");
+  }
   stdout.write(`\n→ ${role} → ${kind} (${slot + 1}/${state.harnessChain.length})\n`);
   try {
-    callHerdr(["agent", "prompt", name, prompt, "--wait", "--timeout", String(timeoutMs)]);
+    callHerdr(["agent", "prompt", name, handoffPrompt, "--wait", "--timeout", String(timeoutMs)]);
   } catch (error) {
     state.stage = `paused:${role}`;
     state.pauseReason = error.message;
@@ -172,6 +266,63 @@ async function runAgent(state, role, prompt, marker) {
     throw new Error(`${state.pauseReason} The run is saved and paused; inspect the ${role} pane before retrying.`);
   }
   return value;
+}
+
+async function runInteractiveIntake(state) {
+  await ensureWorker(state, 0);
+  const name = state.activeAgentName;
+  const resuming = state.stage === "waiting:first-harness-intake" && state.lastPrompt?.marker;
+  const marker = resuming ? state.lastPrompt.marker : `RELAY_PLAN_${randomUUID().slice(0, 8)}:`;
+  if (!resuming) {
+    state.stage = "waiting:first-harness-intake";
+    state.lastPrompt = { role: "planner", harness: state.harnessChain[0], chainSlot: 0, at: new Date().toISOString(), marker };
+    await persist(state);
+  }
+  const prompt = [
+    "You are the user's front-door coding harness in a multi-harness relay. The user will describe a code change directly to you in this pane.",
+    "Discuss and clarify the request with the user in this pane. Draft a concise ordered implementation plan and show it to the user. Do not edit files or create tickets yet.",
+    `When the request is clear and the user has approved the proposed plan, return exactly one final line in this shape: ${marker} {"request":"...","needsDesignReview":false,"needsSecondOpinion":false,"tasks":[{"title":"...","acceptanceCriteria":"..."}]}.`,
+    "Set needsDesignReview=true only when the change has meaningful UI, architecture, data-model, API, or interaction choices. Set needsSecondOpinion=true only when an independent plan review would materially reduce risk. Include between 1 and 20 tasks. Every task needs a title and acceptance criteria.",
+    "The final marker is the handoff signal to Relay. Until then, stay in conversation with the user and do not start implementation.",
+  ].join("\n\n");
+  if (!resuming) {
+    try {
+      callHerdr(["agent", "prompt", name, prompt]);
+    } catch (error) {
+      state.stage = "paused:first-harness-intake";
+      state.pauseReason = error.message;
+      await persist(state);
+      throw new Error(`Could not start the first-harness conversation. The run is saved for inspection: ${error.message}`);
+    }
+    state.chainCursor = state.harnessChain.length > 1 ? 1 : 0;
+    await persist(state);
+  }
+  stdout.write(`\nTalk to ${state.harnessChain[0]} in its focused pane. Relay is monitoring for the approved plan.\n`);
+  return waitForInteractiveMarker(state, name, marker);
+}
+
+async function waitForInteractiveMarker(state, name, marker) {
+  let blockedNoticeShown = false;
+  while (true) {
+    const recent = callHerdr(["agent", "read", name, "--source", "recent-unwrapped", "--lines", "200"], { allowFailure: true });
+    let value = extractMarker(recent.stdout, marker);
+    if (value !== null) return value;
+    if (recent.status !== 0) {
+      const visible = callHerdr(["agent", "read", name, "--source", "visible"], { allowFailure: true });
+      value = extractMarker(visible.stdout, marker);
+      if (value !== null) return value;
+    }
+    const snapshot = herdrJson(["agent", "get", name]);
+    const agent = snapshot?.result?.agent;
+    const lifecycle = agent?.state || agent?.status || agent?.lifecycle_state;
+    if (lifecycle === "blocked" && !blockedNoticeShown) {
+      stdout.write(`\n${state.harnessChain[state.activeSlot]} needs your input in its focused pane. Relay is waiting.\n`);
+      blockedNoticeShown = true;
+    } else if (lifecycle !== "blocked") {
+      blockedNoticeShown = false;
+    }
+    await delay(900);
+  }
 }
 
 function formatTask(task, index) {
@@ -190,49 +341,75 @@ function validateTasks(tasks, label) {
   return tasks;
 }
 
-async function ensureWorkers(state) {
+async function ensureWorker(state, slot) {
+  if (state.workerRunId === state.runId && state.activeSlot === slot && state.workerTabId && state.activeAgentName) return;
+  const previousTabId = state.workerTabId;
+  const kind = state.harnessChain[slot];
   const tab = herdrJson(["tab", "create", "--workspace", state.workspaceId, "--cwd", state.cwd,
-    "--label", `Relay ${state.runId.slice(0, 8)}`, "--no-focus"]);
+    "--label", `Relay ${kind} ${state.runId.slice(0, 8)}`, "--focus"]);
+  const workerTabId = tab?.result?.tab?.tab_id;
   const rootPane = tab?.result?.root_pane?.pane_id;
-  if (!rootPane) throw new Error("Herdr did not return a root pane when creating the worker tab.");
-  const paneIds = [rootPane];
-  let anchor = rootPane;
-  for (let i = 1; i < state.harnessChain.length; i++) {
-    const split = herdrJson(["pane", "split", anchor, "--direction", "down", "--cwd", state.cwd, "--no-focus"]);
-    const paneId = split?.result?.pane?.pane_id;
-    if (!paneId) throw new Error("Herdr did not return a pane id when creating a worker pane.");
-    paneIds.push(paneId);
-    anchor = paneId;
-  }
-  state.panes = paneIds;
-  state.agents = state.harnessChain.map((_, index) => agentName(state.runId, index));
+  if (!workerTabId || !rootPane) throw new Error("Herdr did not return a worker tab and root pane.");
+  state.workerTabId = workerTabId;
+  state.workerPaneId = rootPane;
+  state.activeSlot = slot;
+  state.activeAgentName = agentName(state.runId, slot);
+  state.workerRunId = state.runId;
   await persist(state);
-  for (let index = 0; index < state.harnessChain.length; index++) {
-    const kind = state.harnessChain[index];
-    stdout.write(`Starting chain slot ${index + 1}: ${kind}…\n`);
-    callHerdr(["agent", "start", state.agents[index], "--kind", kind, "--pane", state.panes[index]]);
+  stdout.write(`Starting chain slot ${slot + 1}: ${kind}…\n`);
+  callHerdr(["agent", "start", state.activeAgentName, "--kind", kind, "--pane", rootPane]);
+  if (previousTabId && previousTabId !== workerTabId) {
+    callHerdr(["tab", "close", previousTabId]);
   }
+  await persist(state);
 }
 
-async function execute(state, changeRequest) {
-  await ensureWorkers(state);
-  const planMarker = `RELAY_PLAN_${randomUUID().slice(0, 8)}:`;
-  const plan = await runAgent(state, "planner", [
-    "Create a concise ordered implementation plan for the requested code change.",
-    `Return exactly one final line in this format: ${planMarker} {\"needsDesignReview\":false,\"needsSecondOpinion\":false,\"tasks\":[{\"title\":\"...\",\"acceptanceCriteria\":\"...\"}]}`,
-    "Set needsDesignReview=true when the change has meaningful UI, architecture, data-model, API, or interaction choices that merit design input. Set needsSecondOpinion=true when an independent plan review would materially reduce risk. Otherwise set each to false. Do not edit files.",
-    `\nChange request:\n${changeRequest}`,
-  ].join("\n"), planMarker);
-  if (!plan || typeof plan.needsDesignReview !== "boolean" || typeof plan.needsSecondOpinion !== "boolean") {
+async function runInteractiveApproval(state, tasks, reason = "Approve the final plan") {
+  const slot = state.chainCursor;
+  const kind = state.harnessChain[slot];
+  await ensureWorker(state, slot);
+  const name = state.activeAgentName;
+  const marker = `RELAY_APPROVAL_${randomUUID().slice(0, 8)}:`;
+  state.chainCursor = (slot + 1) % state.harnessChain.length;
+  state.stage = "waiting:user-plan-approval";
+  state.lastPrompt = { role: "plan-approval", harness: kind, chainSlot: slot, at: new Date().toISOString(), marker };
+  await persist(state);
+  const prompt = [
+    `${reason}. You are the current harness in a multi-harness relay. Present the plan below to the user and discuss any requested changes in this pane. Do not edit files.`,
+    "After the user explicitly approves the final plan, return the final tasks and a one-line marker response. If the user requests changes, revise the plan and ask again.",
+    `After approval, return exactly one final line in this shape: ${marker} {"decision":"approve","tasks":[{"title":"...","acceptanceCriteria":"..."}]}.`,
+    `Agreed change request:\n${state.changeRequest}`,
+    `Plan to approve:\n${tasks.map(formatTask).join("\n\n")}`,
+  ].join("\n\n");
+  try { callHerdr(["agent", "prompt", name, prompt]); }
+  catch (error) {
+    state.stage = "paused:user-plan-approval";
+    state.pauseReason = error.message;
+    await persist(state);
+    throw new Error(`Could not start the plan approval handoff: ${error.message}`);
+  }
+  stdout.write(`\n${kind} has the final plan for user approval. Continue in its focused pane.\n`);
+  return waitForInteractiveMarker(state, name, marker);
+}
+
+async function execute(state) {
+  const plan = await runInteractiveIntake(state);
+  if (!plan || typeof plan !== "object" || typeof plan.request !== "string" || !plan.request.trim()) {
+    throw new Error("The first harness plan must include the agreed request text.");
+  }
+  if (typeof plan.needsDesignReview !== "boolean" || typeof plan.needsSecondOpinion !== "boolean") {
     throw new Error("Planner must return boolean needsDesignReview and needsSecondOpinion fields.");
   }
+  state.changeRequest = plan.request.trim();
   let tasks = validateTasks(plan.tasks, "Planner response");
+  state.tasks = tasks;
+  await persist(state);
   if (plan.needsDesignReview) {
     const designMarker = `RELAY_DESIGN_${randomUUID().slice(0, 8)}:`;
     const design = await runAgent(state, "designer", [
       "Review this plan for design, architecture, data-model, API, and interaction choices. Do not edit files.",
       `Return one final line: ${designMarker} {\"recommendations\":\"specific design decisions, tradeoffs, and changes the planner should consider\"}`,
-      `Change request:\n${changeRequest}`,
+      `Change request:\n${state.changeRequest}`,
       `Proposed plan:\n${tasks.map(formatTask).join("\n\n")}`,
     ].join("\n\n"), designMarker);
     state.designNote = design?.recommendations || String(design);
@@ -240,7 +417,7 @@ async function execute(state, changeRequest) {
     await persist(state);
     const revisedMarker = `RELAY_REVISED_PLAN_${randomUUID().slice(0, 8)}:`;
     const revised = await runAgent(state, "planner", [
-      "Revise your plan using the design review. Keep sound tasks and update the tasks and acceptance criteria where needed. Do not edit files.",
+      "Revise your plan using the design review. Keep sound tasks and update tasks and acceptance criteria where needed. Do not edit files.",
       `Return exactly one final line: ${revisedMarker} {\"tasks\":[{\"title\":\"...\",\"acceptanceCriteria\":\"...\"}]}`,
       `Original plan:\n${tasks.map(formatTask).join("\n\n")}`,
       `Design recommendations:\n${state.designNote}`,
@@ -251,8 +428,8 @@ async function execute(state, changeRequest) {
     const opinionMarker = `RELAY_OPINION_${randomUUID().slice(0, 8)}:`;
     const opinion = await runAgent(state, "second-opinion", [
       "Give an independent second opinion on this implementation plan. Do not edit files.",
-      `Return one final line in this format: ${opinionMarker} {\"decision\":\"approve\"} OR ${opinionMarker} {\"decision\":\"revise\",\"findings\":\"specific risks or missing work\"}`,
-      `Change request:\n${changeRequest}`,
+      `Return one final line: ${opinionMarker} {\"decision\":\"approve\"} OR ${opinionMarker} {\"decision\":\"revise\",\"findings\":\"specific risks or missing work\"}`,
+      `Change request:\n${state.changeRequest}`,
       `Plan:\n${tasks.map(formatTask).join("\n\n")}`,
       state.designNote ? `Design recommendations:\n${state.designNote}` : "",
     ].filter(Boolean).join("\n\n"), opinionMarker);
@@ -270,55 +447,63 @@ async function execute(state, changeRequest) {
       throw new Error("Second-opinion harness returned an invalid decision; workflow paused.");
     }
   }
+  if (plan.needsDesignReview || plan.needsSecondOpinion) {
+    const approval = await runInteractiveApproval(state, tasks, "Review the plan after design and second-opinion feedback");
+    if (approval?.decision !== "approve") throw new Error("Plan approval handoff did not return decision=approve.");
+    tasks = validateTasks(approval.tasks, "User-approved plan");
+  }
   state.tasks = tasks;
   state.stage = "planned";
   await persist(state);
-  stdout.write(`\nPlan has ${tasks.length} task(s):\n${tasks.map(formatTask).join("\n\n")}\n`);
-  const proceed = (await ask("Proceed with this plan? Type yes to continue", "no")).toLowerCase();
-  if (proceed !== "yes") {
-    state.stage = "paused:plan-approval";
-    await persist(state);
-    stdout.write("Plan saved. No implementation work was started.\n");
-    return;
-  }
+  await createBoardTickets(state, tasks);
 
   for (let index = 0; index < tasks.length; index++) {
     const taskText = formatTask(tasks[index], index);
+    const ticketId = state.livestock.taskTicketIds[index];
     let approved = false;
+    state.taskIndex = index;
+    await persist(state);
+    await updateBoardTicket(state, ticketId, { status: "in progress", note: "Implementation started." });
     for (let round = 1; round <= maxReviewRounds && !approved; round++) {
       const implementationMarker = `RELAY_IMPLEMENTATION_${randomUUID().slice(0, 8)}:`;
       const result = await runAgent(state, "implementer", [
-        `Implement task ${index + 1} of ${tasks.length}. Work only on this task and its acceptance criteria.`,
+        `Implement Livestock ticket ${ticketId}, task ${index + 1} of ${tasks.length}. Work only on this ticket's acceptance criteria.`,
+        `Parent ticket: ${state.livestock.parentTicketId}. The project board at ${state.livestock.boardPath} is the durable context for this run.`,
         taskText,
         round > 1 ? `Address these review findings from the previous round:\n${state.reviewFindings}` : "",
         `When finished, respond with a short summary and a final line: ${implementationMarker} {\"status\":\"complete\",\"summary\":\"...\"}.`,
       ].filter(Boolean).join("\n\n"), implementationMarker);
       if (result?.status !== "complete") throw new Error("Implementer did not report status=complete; workflow paused.");
+      await updateBoardTicket(state, ticketId, { status: "in progress", note: `Implementation round ${round}: ${result.summary || "complete"}` });
       const reviewMarker = `RELAY_REVIEW_${randomUUID().slice(0, 8)}:`;
       const review = await runAgent(state, "reviewer", [
-        `Review the current diff for task ${index + 1} of ${tasks.length}.`, taskText,
+        `Review Livestock ticket ${ticketId} for task ${index + 1} of ${tasks.length}.`, taskText,
         "Check correctness and acceptance criteria. Do not edit files.",
         `Return a final line: ${reviewMarker} {\"decision\":\"approve\"} OR ${reviewMarker} {\"decision\":\"changes\",\"findings\":\"specific actionable findings\"}.`,
       ].join("\n\n"), reviewMarker);
       if (review?.decision === "approve") approved = true;
-      else if (review?.decision === "changes" && review.findings) state.reviewFindings = review.findings;
-      else throw new Error("Reviewer returned an invalid decision; workflow paused.");
+      else if (review?.decision === "changes" && review.findings) {
+        state.reviewFindings = review.findings;
+        await updateBoardTicket(state, ticketId, { note: `Review requested changes: ${review.findings}` });
+      } else throw new Error("Reviewer returned an invalid decision; workflow paused.");
       state.completedReviewRounds = (state.completedReviewRounds || 0) + 1;
       state.taskIndex = index;
       await persist(state);
     }
     if (!approved) throw new Error(`Task ${index + 1} reached the ${maxReviewRounds}-round review limit. Workflow paused for human review.`);
+    await updateBoardTicket(state, ticketId, { status: "done", note: "Implementation approved by reviewer." });
     state.reviewFindings = null;
     state.approvedTasks = [...(state.approvedTasks || []), index];
     state.stage = "task-approved";
     await persist(state);
-    stdout.write(`✓ Task ${index + 1} approved.\n`);
+    stdout.write(`✓ Livestock ticket ${ticketId} approved.\n`);
   }
+  await updateBoardTicket(state, state.livestock.parentTicketId, { status: "done", note: "All task tickets completed and reviewed." });
   state.stage = "complete";
   state.completedAt = new Date().toISOString();
   await persist(state);
-  callHerdr(["notification", "show", "Harness Relay complete", "--body", `${tasks.length} task(s) implemented and reviewed`, "--sound", "done"], { allowFailure: true });
-  stdout.write("\nWorkflow complete. Every task received reviewer approval.\n");
+  callHerdr(["notification", "show", "Harness Relay change complete", "--body", `${tasks.length} Livestock task(s) implemented and reviewed`, "--sound", "done"], { allowFailure: true });
+  stdout.write("\nChange complete. Livestock tickets are up to date.\n");
 }
 
 async function main() {
@@ -335,34 +520,47 @@ async function main() {
     .find((candidate) => typeof candidate === "string" && path.isAbsolute(candidate));
   if (!projectCwd) throw new Error("Could not resolve the Herdr workspace directory from plugin context.");
   await acquireProjectLock(projectCwd);
-  stdout.write("Harness Relay\nPlan a change, then send each task through implementation and review.\n\n");
+  stdout.write("Harness Relay coordinator\nSelect your harness chain once. Then start each change in the focused first-harness pane; Relay coordinates the handoffs in the background.\n\n");
   const saved = await loadState(projectCwd);
-  if (saved && !["complete", "cancelled"].includes(saved.stage)) {
+  const canResumeIntake = saved?.stage === "waiting:first-harness-intake" && saved.activeAgentName && saved.lastPrompt?.marker;
+  let abandonedRun = null;
+  if (saved && !["complete", "cancelled"].includes(saved.stage) && !canResumeIntake) {
     stdout.write(`Saved run ${saved.runId.slice(0, 8)} is at stage ${saved.stage}.\n`);
-    stdout.write("Automatic resume is disabled because a prompt may already have been delivered. Inspect the recorded worker panes before deciding whether to abandon this run.\n");
+    stdout.write("Automatic resume is disabled because a prompt may already have been delivered. Inspect the active worker pane before deciding whether to abandon this run.\n");
     if ((await ask("Type new to abandon its saved state and start another run", "no")).toLowerCase() !== "new") return;
+    abandonedRun = saved;
   }
+  if (canResumeIntake) stdout.write("Resuming the first harness intake for the saved run.\n");
   const setup = await configureHarnesses(await loadHarnessSetup());
   const { harnessChain } = setup;
-  const changeRequest = await ask("Describe the code change");
-  if (!changeRequest) throw new Error("A change description is required.");
-  const state = {
-    schemaVersion: 1,
-    runId: randomUUID(),
-    cwd: projectCwd,
-    workspaceId: process.env.HERDR_WORKSPACE_ID,
-    changeRequest,
-    harnessChain,
-    chainCursor: 0,
-    createdAt: new Date().toISOString(),
-    stage: "initializing",
-    tasks: [],
-    approvedTasks: [],
-    panes: [],
-    agents: [],
-  };
-  await persist(state);
-  await execute(state, changeRequest);
+  let previous = canResumeIntake ? null : saved?.stage === "complete" ? saved : abandonedRun;
+  let resume = canResumeIntake ? saved : null;
+  while (true) {
+    const state = resume || {
+      schemaVersion: 1,
+      runId: randomUUID(),
+      cwd: projectCwd,
+      workspaceId: process.env.HERDR_WORKSPACE_ID,
+      changeRequest: "",
+      harnessChain,
+      chainCursor: 0,
+      createdAt: new Date().toISOString(),
+      stage: "initializing",
+      tasks: [],
+      approvedTasks: [],
+      workerTabId: previous?.workerTabId || null,
+      workerPaneId: previous?.workerPaneId || null,
+      activeSlot: previous?.activeSlot ?? null,
+      activeAgentName: previous?.activeAgentName || null,
+      workerRunId: previous?.workerRunId || null,
+    };
+    await persist(state);
+    resume = null;
+    await execute(state);
+    if (state.stage !== "complete") break;
+    previous = state;
+    stdout.write("\nRelay is returning the baton to the first harness for your next change.\n");
+  }
 }
 
 try {

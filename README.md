@@ -46,9 +46,13 @@ To launch a run:
 herdr plugin action invoke community.harness-relay.open-relay
 ```
 
-Herdr opens a new **Harness Relay** tab. Enter at least two different harness kinds, separated by commas (for example, `codex,claude,opencode`). Input order does not matter: Relay uses the order in its harness list and displays the resulting rotation. Then describe the change. Relay creates a separate worker tab with one pane for each selected harness. The planner decides whether design input or a second opinion is warranted; setup does not ask you to assign roles or enable those steps.
+Herdr opens a small **Harness Relay coordinator** tab. Enter at least two different harness kinds, separated by commas (for example, `codex,claude,opencode`). Input order does not matter: Relay uses the order in its harness list and displays the resulting rotation. Relay remembers that selection for later changes and future sessions.
 
-Installing the plugin registers the action; it does not open the setup console. This version does not assign a keyboard shortcut, so use the command above to start it. To confirm the action is installed, run:
+After setup, Relay opens the first harness in the focused worker tab. Start the change by talking to that harness; clarify and approve the plan in its pane. Relay watches for the approved plan handoff and then coordinates the remaining harnesses in rotation. Only the active harness pane stays open as the baton moves. When all tasks are reviewed and complete, Relay returns to the first harness for the next change.
+
+The coordinator runs in the background while you interact with the focused harness pane. Relay records the approved plan and each implementation task as issues in the project's `.herdr-issues.json` file, which the Livestock plugin displays. Relay also saves workflow state separately so it can track handoffs and recover an interrupted intake. Livestock is optional; without it, Relay still runs and the JSON issue file remains available as project-local context. The planner decides whether design input or a second opinion is warranted; setup does not ask you to assign roles or enable those steps.
+
+Installing the plugin registers the action; it does not open the coordinator. This version does not assign a keyboard shortcut, so use the command above to start it. To confirm the action is installed, run:
 
 ```sh
 herdr plugin action list --plugin community.harness-relay
@@ -68,30 +72,32 @@ Harness kinds offered by the current setup are: Claude Code (`claude`), Codex (`
 
 ## What happens during handoff
 
-The plugin creates a separate worker tab in the same Herdr workspace, with one pane for each harness in the chain. It starts each harness in its own pane, without changing the user's focus. The panes use the same project checkout, and only one harness receives a workflow prompt at a time. Relay advances the chain after every prompt:
+Relay starts the first harness in a focused worker tab and leaves its coordinator running in the background. On each handoff, it opens the next harness in a new worker tab, then closes the previous worker tab after startup succeeds. The active harness has the same project checkout; only one worker pane is kept open at a time. Relay advances the chain after every prompt:
 
 ```text
-[planning → optional design review → planner revision]
+[first-harness discussion and plan]
+  → [optional design review → planner revision]
   → [optional second opinion → optional plan revision]
-  → your plan approval → implement task → review task
+  → [user approval when the plan changed] → implement ticket → review ticket
   → (implement requested changes → review again) → next task → complete
 ```
 
-For the selected set **Codex, Claude Code, and OpenCode**, Relay chooses the rotation **Claude Code → Codex → OpenCode** from its harness list. The first task goes like this:
+For the selected set **Codex, Claude Code, and OpenCode**, Relay chooses the rotation **Claude Code → Codex → OpenCode** from its harness list. The first change goes like this:
 
-1. Claude Code plans the change.
-2. Codex implements the first task.
+1. The user discusses the change and approves its plan with Claude Code.
+2. Codex implements the first Livestock task ticket.
 3. OpenCode reviews it.
 4. If changes are requested, Claude Code implements the fixes and Codex reviews them.
-5. After approval, OpenCode implements the next task; the chain keeps rotating.
+5. After approval, OpenCode implements the next task ticket; the chain keeps rotating.
 
-Relay wraps from the last harness back to the first. Optional design and second-opinion steps also take the next position in the same rotation. You must type `yes` to approve the plan before implementation starts. Each task gets up to three implementation/review rounds. The workflow advances to the next task only after reviewer approval.
+Relay wraps from the last harness back to the first. Optional design and second-opinion steps also take the next position in the same rotation. If those steps change the plan, the active harness presents the updated plan to the user for approval before implementation starts. Each task gets up to three implementation/review rounds. The workflow advances to the next task only after reviewer approval.
 
-Harness Relay uses Herdr's `agent start`, `agent prompt --wait`, and `agent read` commands. It waits for Herdr to observe the harness become active and settle, then checks the harness's latest response for a fresh, per-prompt marker. The marker token is generated for that handoff; the harness is instructed to copy the exact marker into its final response line.
+Harness Relay uses Herdr's `agent start`, `agent prompt`, `agent read`, and `agent get` commands. For automated handoffs, it waits for Herdr to observe the harness become active and settle, then checks the response for a fresh, per-prompt marker. During user intake, it monitors the first harness's output for the approved-plan marker. The marker token is generated for that handoff; the harness is instructed to copy the exact marker into its final response line.
 
 | Role | Required final response line |
 | --- | --- |
-| Planner | `RELAY_PLAN_<token>: {"needsDesignReview":false,"needsSecondOpinion":false,"tasks":[{"title":"...","acceptanceCriteria":"..."}]}` |
+| First harness plan | `RELAY_PLAN_<token>: {"request":"...","needsDesignReview":false,"needsSecondOpinion":false,"tasks":[{"title":"...","acceptanceCriteria":"..."}]}` |
+| User approval after plan revision | `RELAY_APPROVAL_<token>: {"decision":"approve","tasks":[{"title":"...","acceptanceCriteria":"..."}]}` |
 | Planner revising after second opinion | `RELAY_REVISED_PLAN_<token>: {"tasks":[{"title":"...","acceptanceCriteria":"..."}]}` |
 | Designer | `RELAY_DESIGN_<token>: {"recommendations":"..."}` |
 | Second opinion | `RELAY_OPINION_<token>: {"decision":"approve"}` or `RELAY_OPINION_<token>: {"decision":"revise","findings":"..."}` |
@@ -102,13 +108,13 @@ The planner must return between 1 and 20 tasks. Each task must have a `title` an
 
 ## Run state and recovery
 
-The plugin stores workflow state in Herdr's plugin state directory, keyed by the resolved project path. It records the request, automatic harness rotation, current chain position, worker pane and agent names, plan, completed approvals, current stage, and latest handoff marker. The selected harnesses are stored separately in the plugin config directory.
+The plugin stores workflow state in Herdr's plugin state directory, keyed by the resolved project path. It records the request, automatic harness rotation, current chain position, active worker tab and agent, plan, Livestock ticket IDs, completed approvals, current stage, and latest handoff marker. The selected harnesses are stored separately in the plugin config directory.
 
 A project lock prevents two Harness Relay controllers from running against the same checkout at once. Worker panes share the checkout, so do not start another agent workflow that may edit those files while Relay is working.
 
-Relay saves its stage before sending every prompt. If Herdr does not confirm a handoff, a harness becomes blocked, the expected marker is missing, the plan is invalid, or the review limit is reached, the workflow stops and reports the issue. It does not automatically replay an interrupted prompt: a prompt may have reached the harness before the controller stopped. Inspect the recorded worker pane and saved state before deciding what to do.
+Relay saves its stage before sending every prompt. During intake, the coordinator monitors the first harness pane until it returns the approved-plan marker. If Herdr does not confirm a handoff, a harness becomes blocked, the expected marker is missing, the plan is invalid, or the review limit is reached, the workflow stops and reports the issue. Other interrupted prompts are not automatically replayed because they may already have reached the harness. Inspect the active worker pane and saved state before deciding what to do.
 
-When a new run starts for a project with an unfinished saved run, Relay shows its run ID and stage. Inspect the worker panes first. Type `new` only if you intend to abandon that saved run and start another; this does not close or clean up its worker panes. If the process was forcibly terminated and its project lock remains, confirm no Relay controller is still running before removing the stale `.lock` file from Herdr's plugin state directory.
+If the coordinator stops while waiting for the first harness's approved plan, starting Relay again resumes that intake without resending its prompt. For other unfinished stages, Relay shows the run ID and stage; inspect the active worker pane before deciding whether to abandon it. Moving the baton closes the previous harness tab after the next harness starts, so only one worker pane remains active. If the process was forcibly terminated and its project lock remains, confirm no Relay controller is still running before removing the stale `.lock` file from Herdr's plugin state directory.
 
 ## Troubleshooting
 
