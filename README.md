@@ -1,12 +1,12 @@
 # Herdr Harness Relay
 
-Harness Relay coordinates a coding change across multiple coding harnesses inside Herdr. It turns a request into an ordered plan, then sends each task through implementation and review. A task advances only when its reviewer explicitly approves it.
+Harness Relay coordinates a coding change across multiple coding harnesses inside Herdr. You select which harnesses you use; Relay decides their rotation order. At every handoff, the next harness takes the next role, like passing a parcel. Roles belong to workflow steps; they are not permanently assigned to particular harnesses.
 
 ## Requirements
 
 - Herdr `0.7.3` or newer.
 - Node.js `20` or newer.
-- At least one supported harness installed and authenticated for each role you assign.
+- At least two supported harnesses selected, installed, and authenticated.
 - A Herdr workspace open at the project you want to change.
 
 Harness Relay uses Herdr's plugin, workspace, pane, and agent CLI commands. It does not install coding harnesses or authenticate them for you.
@@ -36,44 +36,62 @@ herdr plugin uninstall community.harness-relay
 
 ## Start a workflow
 
-Open a Herdr workspace for the target project and invoke **Start Harness Relay** from that workspace's plugin actions. You can also invoke the action from a Herdr-managed terminal in that workspace:
+To launch a run:
+
+1. Open Herdr and select the workspace for the project you want to change.
+2. Open a terminal pane in that workspace.
+3. Run this command in the pane:
 
 ```sh
 herdr plugin action invoke community.harness-relay.open-relay
 ```
 
-Installing the plugin registers its Herdr action; it does not open the setup console. The first time you invoke **Start Harness Relay**, the console asks you to choose harnesses for the required roles:
+Herdr opens a new **Harness Relay** tab. Enter at least two different harness kinds, separated by commas (for example, `codex,claude,opencode`). Input order does not matter: Relay uses the order in its harness list and displays the resulting rotation. Then describe the change. Relay creates a separate worker tab with one pane for each selected harness. The planner decides whether design input or a second opinion is warranted; setup does not ask you to assign roles or enable those steps.
+
+Installing the plugin registers the action; it does not open the setup console. This version does not assign a keyboard shortcut, so use the command above to start it. To confirm the action is installed, run:
+
+```sh
+herdr plugin action list --plugin community.harness-relay
+```
+
+The required workflow steps are:
 
 1. **Planner** breaks the request into small tasks with acceptance criteria. It must not edit files.
 2. **Implementer** implements the current task.
 3. **Reviewer** checks the diff against that task's acceptance criteria. It must not edit files.
 
-You can also enable:
+The planner also decides whether the proposed change needs a design review or independent second opinion. When needed, Relay gives that role to the next harness in the rotation. The designer reviews the proposed plan and the planner then revises it; the second opinion can approve the plan or ask for one revision. These decisions happen automatically, with no extra role setup.
 
-- **Designer**, which provides design guidance before planning and must not edit files.
-- **Second opinion**, which reviews the proposed plan. It can approve the plan or ask the planner for one revision.
-
-Role assignments and optional slots are saved in Herdr's plugin config directory for your user. Later runs show the saved assignments; choose whether to keep or change them. The console then asks for the change request.
+The harness selection is saved in Herdr's plugin config directory for your user. Later runs show the saved selection and automatic rotation; keep it or select a different set.
 
 Harness kinds offered by the current setup are: Claude Code (`claude`), Codex (`codex`), OpenCode (`opencode`), GitHub Copilot CLI (`copilot`), Pi (`pi`), Gemini CLI (`gemini`), Cursor Agent (`cursor`), Amp (`amp`), Droid (`droid`), Kimi Code (`kimi`), Kiro CLI (`kiro`), Cline (`cline`), Devin CLI (`devin`), Antigravity CLI (`agy`), Hermes Agent (`hermes`), Kilo Code CLI (`kilo`), Qoder CLI (`qodercli`), Qwen Code (`qwen`), MastraCode (`mastracode`), Grok CLI (`grok`), OMP (`omp`), Maki (`maki`), Letta Code (`letta`), and Muse (`muse`). The installed Herdr version must recognize the selected kind, and its executable must be available on the machine.
 
 ## What happens during handoff
 
-The plugin creates a separate worker tab in the same Herdr workspace, with one pane for each selected role. It starts the configured harness in each pane, without changing the user's focus. The panes use the same project checkout, and the workflow runs one role at a time:
+The plugin creates a separate worker tab in the same Herdr workspace, with one pane for each harness in the chain. It starts each harness in its own pane, without changing the user's focus. The panes use the same project checkout, and only one harness receives a workflow prompt at a time. Relay advances the chain after every prompt:
 
 ```text
-optional design → planning → optional second opinion → plan approval
-  → implement task → review task → (fix findings → review again)
-  → next task → complete
+[planning → optional design review → planner revision]
+  → [optional second opinion → optional plan revision]
+  → your plan approval → implement task → review task
+  → (implement requested changes → review again) → next task → complete
 ```
 
-You must type `yes` to approve the plan before implementation starts. Each task gets up to three implementation/review rounds. If the reviewer asks for changes, those findings are sent to the implementer before the next review. The workflow advances only after reviewer approval.
+For the selected set **Codex, Claude Code, and OpenCode**, Relay chooses the rotation **Claude Code → Codex → OpenCode** from its harness list. The first task goes like this:
+
+1. Claude Code plans the change.
+2. Codex implements the first task.
+3. OpenCode reviews it.
+4. If changes are requested, Claude Code implements the fixes and Codex reviews them.
+5. After approval, OpenCode implements the next task; the chain keeps rotating.
+
+Relay wraps from the last harness back to the first. Optional design and second-opinion steps also take the next position in the same rotation. You must type `yes` to approve the plan before implementation starts. Each task gets up to three implementation/review rounds. The workflow advances to the next task only after reviewer approval.
 
 Harness Relay uses Herdr's `agent start`, `agent prompt --wait`, and `agent read` commands. It waits for Herdr to observe the harness become active and settle, then checks the harness's latest response for a fresh, per-prompt marker. The marker token is generated for that handoff; the harness is instructed to copy the exact marker into its final response line.
 
 | Role | Required final response line |
 | --- | --- |
-| Planner | `RELAY_PLAN_<token>: {"tasks":[{"title":"...","acceptanceCriteria":"..."}]}` |
+| Planner | `RELAY_PLAN_<token>: {"needsDesignReview":false,"needsSecondOpinion":false,"tasks":[{"title":"...","acceptanceCriteria":"..."}]}` |
 | Planner revising after second opinion | `RELAY_REVISED_PLAN_<token>: {"tasks":[{"title":"...","acceptanceCriteria":"..."}]}` |
 | Designer | `RELAY_DESIGN_<token>: {"recommendations":"..."}` |
 | Second opinion | `RELAY_OPINION_<token>: {"decision":"approve"}` or `RELAY_OPINION_<token>: {"decision":"revise","findings":"..."}` |
@@ -84,7 +102,7 @@ The planner must return between 1 and 20 tasks. Each task must have a `title` an
 
 ## Run state and recovery
 
-The plugin stores workflow state in Herdr's plugin state directory, keyed by the resolved project path. It records the request, role assignments, worker pane and agent names, plan, completed approvals, current stage, and latest handoff marker. Harness role preferences are stored separately in the plugin config directory.
+The plugin stores workflow state in Herdr's plugin state directory, keyed by the resolved project path. It records the request, automatic harness rotation, current chain position, worker pane and agent names, plan, completed approvals, current stage, and latest handoff marker. The selected harnesses are stored separately in the plugin config directory.
 
 A project lock prevents two Harness Relay controllers from running against the same checkout at once. Worker panes share the checkout, so do not start another agent workflow that may edit those files while Relay is working.
 

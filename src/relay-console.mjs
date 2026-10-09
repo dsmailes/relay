@@ -15,7 +15,6 @@ const harnesses = [
   ["mastracode", "MastraCode"], ["grok", "Grok CLI"], ["omp", "OMP"],
   ["maki", "Maki"], ["letta", "Letta Code"], ["muse", "Muse"],
 ];
-const requiredRoles = ["planner", "implementer", "reviewer"];
 const timeoutMs = 60 * 60 * 1000;
 const maxReviewRounds = 3;
 const stateDir = process.env.HERDR_PLUGIN_STATE_DIR;
@@ -27,15 +26,25 @@ function ask(label, fallback = "") {
   return input.question(fallback ? `${label} [${fallback}]: ` : `${label}: `).then((v) => v.trim() || fallback);
 }
 
-async function pickHarness(role, fallback = "") {
-  stdout.write(`\n${role} harness:\n`);
+async function pickHarnessSet(fallback = []) {
+  stdout.write("\nSelect the harnesses you use. Their input order does not affect Relay's automatic rotation:\n");
   harnesses.forEach(([kind, name], i) => stdout.write(`  ${i + 1}. ${name} (${kind})\n`));
   while (true) {
-    const answer = await ask("Select number or harness kind", fallback);
-    const byIndex = harnesses[Number(answer) - 1];
-    const found = byIndex || harnesses.find(([kind]) => kind === answer.toLowerCase());
-    if (found) return found[0];
-    stdout.write("Choose a listed harness kind.\n");
+    const initial = fallback.length ? fallback.join(",") : "";
+    const answer = await ask("Enter at least two harness kinds or numbers, comma separated", initial);
+    const selections = answer.split(",").map((part) => part.trim().toLowerCase()).filter(Boolean);
+    const selected = selections.map((selection) => {
+      const entry = /^\d+$/.test(selection)
+        ? harnesses[Number(selection) - 1]
+        : harnesses.find(([kind]) => kind === selection);
+      return entry?.[0] || null;
+    });
+    if (selected.length >= 2 && selected.every(Boolean) && new Set(selected).size === selected.length) {
+      const chain = harnesses.map(([kind]) => kind).filter((kind) => selected.includes(kind));
+      stdout.write(`\nAutomatic rotation order: ${chain.join(" → ")}\n`);
+      return chain;
+    }
+    stdout.write("Choose at least two different harnesses from the list.\n");
   }
 }
 
@@ -77,17 +86,19 @@ async function saveHarnessSetup(setup) {
 }
 
 async function configureHarnesses(existing) {
+  const savedChain = existing?.harnessChain || (existing?.harnesses ? [...new Set(Object.values(existing.harnesses))] : []);
+  const validSavedChain = savedChain.length >= 2 && new Set(savedChain).size === savedChain.length
+    && savedChain.every((kind) => harnesses.some(([available]) => available === kind));
+  const existingChain = validSavedChain ? harnesses.map(([kind]) => kind).filter((kind) => savedChain.includes(kind)) : [];
   if (existing) {
-    stdout.write(`Saved harness roles: ${Object.entries(existing.harnesses).map(([role, kind]) => `${role}=${kind}`).join(", ")}\n`);
-    if ((await ask("Keep these harness assignments? yes/no", "yes")).toLowerCase() === "yes") return existing;
+    if (validSavedChain) stdout.write(`Saved harness selection; automatic rotation: ${existingChain.join(" → ")}\n`);
+    else stdout.write("The saved harness settings need to be replaced with a selection of at least two supported harnesses.\n");
+    if (validSavedChain && (await ask("Keep this harness selection? yes/no", "yes")).toLowerCase() === "yes") {
+      return { harnessChain: existingChain };
+    }
   }
-  const harnessMap = {};
-  for (const role of requiredRoles) harnessMap[role] = await pickHarness(role, existing?.harnesses?.[role]);
-  const optionalRoles = [];
-  if ((await ask("Add a design slot? yes/no", existing?.optionalRoles?.includes("designer") ? "yes" : "no")).toLowerCase() === "yes") optionalRoles.push("designer");
-  if ((await ask("Add a second-opinion slot? yes/no", existing?.optionalRoles?.includes("second-opinion") ? "yes" : "no")).toLowerCase() === "yes") optionalRoles.push("second-opinion");
-  for (const role of optionalRoles) harnessMap[role] = await pickHarness(role, existing?.harnesses?.[role]);
-  const setup = { harnesses: harnessMap, optionalRoles };
+  const harnessChain = await pickHarnessSet(existingChain);
+  const setup = { harnessChain };
   await saveHarnessSetup(setup);
   return setup;
 }
@@ -122,8 +133,8 @@ async function acquireProjectLock(cwd) {
   throw new Error("Could not acquire the project workflow lock.");
 }
 
-function agentName(runId, role) {
-  return `relay_${runId.slice(0, 8)}_${role}`;
+function agentName(runId, slot) {
+  return `relay_${runId.slice(0, 8)}_h${String(slot + 1).padStart(2, "0")}`;
 }
 
 function extractMarker(text, prefix) {
@@ -135,12 +146,15 @@ function extractMarker(text, prefix) {
 }
 
 async function runAgent(state, role, prompt, marker) {
-  const paneId = state.panes[role];
-  const name = state.agents[role];
+  const slot = state.chainCursor;
+  const kind = state.harnessChain[slot];
+  const paneId = state.panes[slot];
+  const name = state.agents[slot];
+  state.chainCursor = (slot + 1) % state.harnessChain.length;
   state.stage = `waiting:${role}`;
-  state.lastPrompt = { role, at: new Date().toISOString(), marker };
+  state.lastPrompt = { role, harness: kind, chainSlot: slot, at: new Date().toISOString(), marker };
   await persist(state);
-  stdout.write(`\n→ ${role} (${state.harnesses[role]})\n`);
+  stdout.write(`\n→ ${role} → ${kind} (${slot + 1}/${state.harnessChain.length})\n`);
   try {
     callHerdr(["agent", "prompt", name, prompt, "--wait", "--timeout", String(timeoutMs)]);
   } catch (error) {
@@ -168,6 +182,14 @@ function formatTask(task, index) {
   return `${index + 1}. ${task.title}\nAcceptance criteria: ${task.acceptanceCriteria}`;
 }
 
+function validateTasks(tasks, label) {
+  if (!Array.isArray(tasks) || tasks.length === 0 || tasks.length > 20) {
+    throw new Error(`${label} must contain between 1 and 20 tasks.`);
+  }
+  tasks.forEach(formatTask);
+  return tasks;
+}
+
 async function ensureWorkers(state) {
   const tab = herdrJson(["tab", "create", "--workspace", state.workspaceId, "--cwd", state.cwd,
     "--label", `Relay ${state.runId.slice(0, 8)}`, "--no-focus"]);
@@ -175,55 +197,64 @@ async function ensureWorkers(state) {
   if (!rootPane) throw new Error("Herdr did not return a root pane when creating the worker tab.");
   const paneIds = [rootPane];
   let anchor = rootPane;
-  for (let i = 1; i < state.roles.length; i++) {
+  for (let i = 1; i < state.harnessChain.length; i++) {
     const split = herdrJson(["pane", "split", anchor, "--direction", "down", "--cwd", state.cwd, "--no-focus"]);
     const paneId = split?.result?.pane?.pane_id;
     if (!paneId) throw new Error("Herdr did not return a pane id when creating a worker pane.");
     paneIds.push(paneId);
     anchor = paneId;
   }
-  state.panes = Object.fromEntries(state.roles.map((role, index) => [role, paneIds[index]]));
-  state.agents = Object.fromEntries(state.roles.map((role) => [role, agentName(state.runId, role)]));
+  state.panes = paneIds;
+  state.agents = state.harnessChain.map((_, index) => agentName(state.runId, index));
   await persist(state);
-  for (const role of state.roles) {
-    stdout.write(`Starting ${role} (${state.harnesses[role]})…\n`);
-    callHerdr(["agent", "start", state.agents[role], "--kind", state.harnesses[role], "--pane", state.panes[role]]);
+  for (let index = 0; index < state.harnessChain.length; index++) {
+    const kind = state.harnessChain[index];
+    stdout.write(`Starting chain slot ${index + 1}: ${kind}…\n`);
+    callHerdr(["agent", "start", state.agents[index], "--kind", kind, "--pane", state.panes[index]]);
   }
 }
 
 async function execute(state, changeRequest) {
   await ensureWorkers(state);
-  if (state.roles.includes("designer")) {
-    const designMarker = `RELAY_DESIGN_${randomUUID().slice(0, 8)}:`;
-    const design = await runAgent(state, "designer", [
-      "Explore the requested change as a design task. Do not edit files.",
-      `Return one final line in this format: ${designMarker} {\"recommendations\":\"brief design guidance and important tradeoffs\"}`,
-      `Change request:\n${changeRequest}`,
-    ].join("\n\n"), designMarker);
-    state.designNote = design?.recommendations || String(design);
-    state.stage = "design-complete";
-    await persist(state);
-  }
   const planMarker = `RELAY_PLAN_${randomUUID().slice(0, 8)}:`;
   const plan = await runAgent(state, "planner", [
     "Create a concise ordered implementation plan for the requested code change.",
-    `Return exactly one final line in this format: ${planMarker} {\"tasks\":[{\"title\":\"...\",\"acceptanceCriteria\":\"...\"}]}`,
-    "Keep tasks small and sequential. Do not edit files.",
-    state.designNote ? `Design guidance:\n${state.designNote}` : "",
+    `Return exactly one final line in this format: ${planMarker} {\"needsDesignReview\":false,\"needsSecondOpinion\":false,\"tasks\":[{\"title\":\"...\",\"acceptanceCriteria\":\"...\"}]}`,
+    "Set needsDesignReview=true when the change has meaningful UI, architecture, data-model, API, or interaction choices that merit design input. Set needsSecondOpinion=true when an independent plan review would materially reduce risk. Otherwise set each to false. Do not edit files.",
     `\nChange request:\n${changeRequest}`,
   ].join("\n"), planMarker);
-  let tasks = Array.isArray(plan) ? plan : plan?.tasks;
-  if (!Array.isArray(tasks) || tasks.length === 0) throw new Error("Planner must return a non-empty tasks array.");
-  if (tasks.length > 20) throw new Error("Planner returned more than 20 tasks; split the proposal into a smaller plan.");
-  tasks.forEach(formatTask);
-  if (state.roles.includes("second-opinion")) {
+  if (!plan || typeof plan.needsDesignReview !== "boolean" || typeof plan.needsSecondOpinion !== "boolean") {
+    throw new Error("Planner must return boolean needsDesignReview and needsSecondOpinion fields.");
+  }
+  let tasks = validateTasks(plan.tasks, "Planner response");
+  if (plan.needsDesignReview) {
+    const designMarker = `RELAY_DESIGN_${randomUUID().slice(0, 8)}:`;
+    const design = await runAgent(state, "designer", [
+      "Review this plan for design, architecture, data-model, API, and interaction choices. Do not edit files.",
+      `Return one final line: ${designMarker} {\"recommendations\":\"specific design decisions, tradeoffs, and changes the planner should consider\"}`,
+      `Change request:\n${changeRequest}`,
+      `Proposed plan:\n${tasks.map(formatTask).join("\n\n")}`,
+    ].join("\n\n"), designMarker);
+    state.designNote = design?.recommendations || String(design);
+    state.stage = "design-review-complete";
+    await persist(state);
+    const revisedMarker = `RELAY_REVISED_PLAN_${randomUUID().slice(0, 8)}:`;
+    const revised = await runAgent(state, "planner", [
+      "Revise your plan using the design review. Keep sound tasks and update the tasks and acceptance criteria where needed. Do not edit files.",
+      `Return exactly one final line: ${revisedMarker} {\"tasks\":[{\"title\":\"...\",\"acceptanceCriteria\":\"...\"}]}`,
+      `Original plan:\n${tasks.map(formatTask).join("\n\n")}`,
+      `Design recommendations:\n${state.designNote}`,
+    ].join("\n\n"), revisedMarker);
+    tasks = validateTasks(revised?.tasks, "Planner's design revision");
+  }
+  if (plan.needsSecondOpinion) {
     const opinionMarker = `RELAY_OPINION_${randomUUID().slice(0, 8)}:`;
     const opinion = await runAgent(state, "second-opinion", [
       "Give an independent second opinion on this implementation plan. Do not edit files.",
       `Return one final line in this format: ${opinionMarker} {\"decision\":\"approve\"} OR ${opinionMarker} {\"decision\":\"revise\",\"findings\":\"specific risks or missing work\"}`,
       `Change request:\n${changeRequest}`,
       `Plan:\n${tasks.map(formatTask).join("\n\n")}`,
-      state.designNote ? `Design guidance:\n${state.designNote}` : "",
+      state.designNote ? `Design recommendations:\n${state.designNote}` : "",
     ].filter(Boolean).join("\n\n"), opinionMarker);
     if (opinion?.decision === "revise" && opinion.findings) {
       const revisedMarker = `RELAY_REVISED_PLAN_${randomUUID().slice(0, 8)}:`;
@@ -233,10 +264,7 @@ async function execute(state, changeRequest) {
         `Original plan:\n${tasks.map(formatTask).join("\n\n")}`,
         `Second-opinion findings:\n${opinion.findings}`,
       ].join("\n\n"), revisedMarker);
-      tasks = Array.isArray(revised) ? revised : revised?.tasks;
-      if (!Array.isArray(tasks) || tasks.length === 0 || tasks.length > 20) {
-        throw new Error("Planner returned an invalid revised plan; workflow paused.");
-      }
+      tasks = validateTasks(revised?.tasks, "Planner's second-opinion revision");
       state.opinionFindings = opinion.findings;
     } else if (opinion?.decision !== "approve") {
       throw new Error("Second-opinion harness returned an invalid decision; workflow paused.");
@@ -315,7 +343,7 @@ async function main() {
     if ((await ask("Type new to abandon its saved state and start another run", "no")).toLowerCase() !== "new") return;
   }
   const setup = await configureHarnesses(await loadHarnessSetup());
-  const { harnesses: harnessMap, optionalRoles } = setup;
+  const { harnessChain } = setup;
   const changeRequest = await ask("Describe the code change");
   if (!changeRequest) throw new Error("A change description is required.");
   const state = {
@@ -324,14 +352,14 @@ async function main() {
     cwd: projectCwd,
     workspaceId: process.env.HERDR_WORKSPACE_ID,
     changeRequest,
-    harnesses: harnessMap,
-    roles: [...requiredRoles, ...optionalRoles],
+    harnessChain,
+    chainCursor: 0,
     createdAt: new Date().toISOString(),
     stage: "initializing",
     tasks: [],
     approvedTasks: [],
-    panes: {},
-    agents: {},
+    panes: [],
+    agents: [],
   };
   await persist(state);
   await execute(state, changeRequest);
