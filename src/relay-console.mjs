@@ -221,14 +221,41 @@ async function updateBoardTicket(state, issueId, { status, note } = {}) {
 
 function extractMarker(text, prefix) {
   const escaped = prefix.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  // Some terminal UIs decorate assistant-message lines with a leading bullet
-  // (Codex, for example, can render `● MARKER: {...}`). Herdr may preserve
-  // that decoration in recent-unwrapped output, so accept it before the
-  // otherwise exact handoff marker.
-  const matches = [...text.matchAll(new RegExp(`^[\\t ]*(?:[●•◦⏺][\\t ]*)?${escaped}[\\t ]*(.+)$`, "gm"))];
-  const match = matches.at(-1);
-  if (!match) return null;
-  try { return JSON.parse(match[1]); } catch { return match[1].trim(); }
+  // Some terminal UIs decorate assistant-message lines with a leading bullet,
+  // and Herdr can expose long JSON handoffs as wrapped terminal rows.
+  const lines = text.replace(/\r/g, "").split("\n");
+  const markerLine = new RegExp(`^[\\t ]*(?:[●•◦⏺][\\t ]*)?${escaped}[\\t ]*(.*)$`);
+  const knownKeys = new Set([
+    "request", "needsDesignReview", "needsSecondOpinion", "tasks", "title",
+    "acceptanceCriteria", "recommendations", "decision", "findings", "status", "summary",
+  ]);
+  const parseWrappedJson = (parts) => {
+    const candidates = [parts.join("\n"), parts.join(" ")];
+    for (const candidate of candidates) {
+      const normalized = candidate.replace(/"([^"\\]*(?:\\.[^"\\]*)*)"(\s*):/g, (whole, key, colon) => {
+        const compactKey = key.replace(/\s/g, "");
+        return knownKeys.has(compactKey) ? `"${compactKey}"${colon}:` : whole;
+      });
+      try { return JSON.parse(normalized); } catch { /* The handoff may continue on the next wrapped row. */ }
+    }
+    return null;
+  };
+
+  for (let start = lines.length - 1; start >= 0; start--) {
+    const match = lines[start].match(markerLine);
+    if (!match) continue;
+    const parts = [match[1].trim()];
+    let value = parseWrappedJson(parts);
+    if (value !== null) return value;
+    for (let line = start + 1; line < lines.length; line++) {
+      const continuation = lines[line].trim();
+      if (/^(?:✻|❯|⏺\s+(?:RELAY_|Resending)|RELAY_[A-Z0-9_]+:)/.test(continuation)) break;
+      parts.push(continuation);
+      value = parseWrappedJson(parts);
+      if (value !== null) return value;
+    }
+  }
+  return null;
 }
 
 async function runAgent(state, role, prompt, marker) {
