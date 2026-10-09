@@ -311,11 +311,11 @@ async function waitForInteractiveMarker(state, name, marker) {
     const recent = callHerdr(["agent", "read", name, "--source", "recent-unwrapped", "--lines", "200"], { allowFailure: true });
     let value = extractMarker(recent.stdout, marker);
     if (value !== null) return value;
-    if (recent.status !== 0) {
-      const visible = callHerdr(["agent", "read", name, "--source", "visible"], { allowFailure: true });
-      value = extractMarker(visible.stdout, marker);
-      if (value !== null) return value;
-    }
+    // Some harness TUIs render the completed response in the visible screen
+    // without including it in Herdr's recent scrollback snapshot.
+    const visible = callHerdr(["agent", "read", name, "--source", "visible"], { allowFailure: true });
+    value = extractMarker(visible.stdout, marker);
+    if (value !== null) return value;
     const snapshot = herdrJson(["agent", "get", name]);
     const agent = snapshot?.result?.agent;
     const lifecycle = agent?.state || agent?.status || agent?.lifecycle_state;
