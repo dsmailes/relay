@@ -221,7 +221,11 @@ async function updateBoardTicket(state, issueId, { status, note } = {}) {
 
 function extractMarker(text, prefix) {
   const escaped = prefix.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  const matches = [...text.matchAll(new RegExp(`^${escaped}\\s*(.+)$`, "gm"))];
+  // Some terminal UIs decorate assistant-message lines with a leading bullet
+  // (Codex, for example, can render `● MARKER: {...}`). Herdr may preserve
+  // that decoration in recent-unwrapped output, so accept it before the
+  // otherwise exact handoff marker.
+  const matches = [...text.matchAll(new RegExp(`^[\\t ]*(?:[●•◦⏺][\\t ]*)?${escaped}[\\t ]*(.+)$`, "gm"))];
   const match = matches.at(-1);
   if (!match) return null;
   try { return JSON.parse(match[1]); } catch { return match[1].trim(); }
@@ -514,7 +518,9 @@ async function main() {
   })();
   const workspace = herdrJson(["workspace", "get", process.env.HERDR_WORKSPACE_ID]);
   const projectCwd = [context.cwd, context.workspace?.cwd, context.workspace?.path,
-    context.focused_pane?.cwd, context.focusedPane?.cwd, context.worktree?.path,
+    context.focused_pane?.cwd, context.focusedPane?.cwd,
+    context.workspace_cwd, context.workspaceCwd,
+    context.focused_pane_cwd, context.focusedPaneCwd, context.worktree?.path,
     workspace?.result?.workspace?.cwd, workspace?.result?.workspace?.path,
     workspace?.result?.cwd, workspace?.workspace?.cwd, workspace?.workspace?.path]
     .find((candidate) => typeof candidate === "string" && path.isAbsolute(candidate));
