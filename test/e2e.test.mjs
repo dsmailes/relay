@@ -81,8 +81,12 @@ test("full run: rotation, correction, review round, diffs, checkpoints, history"
   assert.equal(state.timeline.length, 12); // intake, design, revision, approval, 4 implementations, 4 reviews
   assert.equal(Object.keys(state.git.checkpoints).length, 3);
   assert.match(sb.run("rev-parse", "refs/relay/" + state.runId.slice(0, 8) + "/task-3"), /^[0-9a-f]{40}/);
-  assert.match(sb.run("status", "--porcelain"), /greeting\.txt/);
-  assert.doesNotMatch(sb.run("status", "--porcelain"), /herdr-issues/);
+  // the finished relay is committed on the current branch, and only the relay's files are in it
+  assert.match(sb.run("log", "-1", "--format=%s"), /Greetings/);
+  assert.equal(sb.run("show", "--name-only", "--format=", "HEAD").trim().split("\n").sort().join(), "README.md,farewell.txt,greeting.txt");
+  assert.equal(sb.run("status", "--porcelain"), "");
+  assert.equal(sb.run("log", "--oneline").trim().split("\n").length, 2);
+  assert.equal(state.done.commit.committed, true);
   const board = JSON.parse(await readFile(path.join(sb.cwd, ".herdr-issues.json"), "utf8"));
   assert.equal(board.issues.length, 4);
   assert.ok(board.issues.every((i) => i.status === "done"));

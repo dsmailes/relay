@@ -3,7 +3,7 @@ import path from "node:path";
 import readline from "node:readline";
 import { stdin, stdout } from "node:process";
 import { createTickets, readTicket, updateTicket } from "./board.mjs";
-import { diffTrees, excludeBoardLocally, saveCheckpoint, snapshotTree } from "./gitdiff.mjs";
+import { commitRun, diffTrees, excludeBoardLocally, headSha, saveCheckpoint, snapshotTree } from "./gitdiff.mjs";
 import { callHerdr, getAgent, herdrJson, notify, requireHerdrPaneContext } from "./herdr.mjs";
 import { detectInstalled, harnesses, inRotationOrder, parseSelection } from "./harnesses.mjs";
 import { extractMarker } from "./markers.mjs";
@@ -83,7 +83,7 @@ async function chooseHarnesses() {
     const missing = chain.filter((kind) => !installed.includes(kind));
     if (missing.length) out(`Note: ${missing.join(", ")} not found on PATH; Relay will stop if Herdr cannot start it.`);
     out(`Rotation order: ${chain.join(" → ")}`);
-    await saveHarnessSetup({ harnessChain: chain });
+    await saveHarnessSetup({ ...saved, harnessChain: chain });
     return chain;
   }
 }
@@ -335,6 +335,14 @@ async function ticketHeader(state, ticketId) {
 
 // ---------------------------------------------------------------- the workflow
 
+function commitMessage(state) {
+  return [
+    `${state.title}`, "",
+    ...state.tasks.map((task) => `- ${task.title}`), "",
+    `Implemented and reviewed by Harness Relay run ${short(state)} (${state.harnessChain.join(" → ")}).`,
+  ].join("\n");
+}
+
 async function planPhase(state) {
   const plan = await runStep(state, intakeStep);
   state.title = plan.title;
@@ -389,7 +397,10 @@ async function runTask(state, index) {
   const task = tasks[index];
   const ticketId = state.livestock.taskTicketIds?.[index];
   state.taskIndex = index;
-  if (!(index in state.git.base)) state.git.base[index] = await snapshotTree(state.cwd);
+  if (!(index in state.git.base)) {
+    state.git.base[index] = await snapshotTree(state.cwd);
+    if (index === 0) state.git.headAtStart = headSha(state.cwd);
+  }
   if (!state.done[`started-${index}`]) {
     await ticketNote(state, ticketId, "Implementation started.", "in progress");
     state.done[`started-${index}`] = true;
@@ -456,6 +467,15 @@ async function execute(state) {
   for (let index = 0; index < state.tasks.length; index++) {
     if (!state.done[`task-${index}`]) await runTask(state, index);
   }
+  if (state.autoCommit && state.done.commit === undefined) {
+    const result = commitRun(state.cwd, {
+      baseTree: state.git.base[0], finalTree: state.git.base[state.tasks.length] ?? await snapshotTree(state.cwd),
+      headAtStart: state.git.headAtStart, message: commitMessage(state),
+    });
+    state.done.commit = result;
+    await logEvent(state, result.committed ? "commit.done" : "commit.skipped", result);
+    await persist(state);
+  }
   const summary = state.timeline.map((entry) => `${entry.role} (${entry.harness}): ${entry.summary}`).join("\n");
   await withBoard(state, () => updateTicket(state.cwd, state.livestock.parentTicketId, {
     status: "done", note: `All task tickets completed and reviewed.\n\nTimeline:\n${summary}`,
@@ -465,7 +485,11 @@ async function execute(state) {
   await archiveRun(state, "complete");
   notify("Harness Relay change complete", `${state.tasks.length} task(s) implemented and reviewed`, "done");
   out(`\nChange complete: ${state.title}`);
-  out(`${state.tasks.length} task(s) implemented and reviewed. Changes are in your working tree, uncommitted.`);
+  const commit = state.done.commit;
+  out(`${state.tasks.length} task(s) implemented and reviewed.`);
+  if (commit?.committed) out(`Committed ${commit.sha.slice(0, 8)} on your current branch (${commit.files.length} file(s)). Not pushed.`);
+  else if (state.autoCommit) out(`Not committed: ${commit?.reason}. The changes are in your working tree.`);
+  else out("Auto-commit is off; the changes are in your working tree, uncommitted.");
   const refs = Object.values(state.git.checkpoints);
   if (refs.length) out(`Checkpoints per task: ${refs.join(", ")}`);
 }
@@ -489,10 +513,10 @@ function resolveProjectCwd() {
   return cwd;
 }
 
-function newState(cwd, harnessChain, previous) {
+function newState(cwd, harnessChain, previous, autoCommit) {
   return {
     schemaVersion: SCHEMA_VERSION, runId: randomUUID(), cwd, workspaceId: process.env.HERDR_WORKSPACE_ID,
-    harnessChain, chainCursor: 0, createdAt: new Date().toISOString(), stage: "initializing",
+    harnessChain, autoCommit, chainCursor: 0, createdAt: new Date().toISOString(), stage: "initializing",
     title: "", changeRequest: "", tasks: [], taskIndex: null,
     done: {}, pending: null, timeline: [], allowedRounds: {},
     git: { base: {}, checkpoints: {} },
@@ -525,8 +549,11 @@ async function main() {
     }
   }
   const harnessChain = resume ? resume.harnessChain : await chooseHarnesses();
+  // Relay commits what it changed when a relay completes. Set "autoCommit": false in harnesses.json to opt out.
+  const autoCommit = (await loadHarnessSetup())?.autoCommit !== false;
+  if (resume) resume.autoCommit ??= autoCommit;
   while (true) {
-    const state = resume || newState(cwd, harnessChain, previous);
+    const state = resume || newState(cwd, harnessChain, previous, autoCommit);
     resume = null;
     currentState = state;
     await persist(state);

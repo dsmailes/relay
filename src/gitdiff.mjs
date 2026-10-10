@@ -1,5 +1,6 @@
 import { spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
+import { existsSync } from "node:fs";
 import { appendFile, mkdir, readFile, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -72,4 +73,50 @@ export async function excludeBoardLocally(cwd) {
   if (current.split("\n").some((line) => line.trim() === BOARD_FILE)) return;
   await mkdir(path.dirname(exclude), { recursive: true });
   await appendFile(exclude, `${current && !current.endsWith("\n") ? "\n" : ""}${BOARD_FILE}\n`);
+}
+
+function gitRun(cwd, args) {
+  const result = spawnSync("git", args, { cwd, encoding: "utf8", maxBuffer: 128 * 1024 * 1024 });
+  return { ok: !result.error && result.status === 0, stdout: result.stdout || "", stderr: (result.stderr || result.error?.message || "").trim() };
+}
+
+const nameList = (output) => output.split("\0").filter(Boolean);
+
+export function headSha(cwd) {
+  return git(cwd, ["rev-parse", "--verify", "-q", "HEAD"])?.trim() || null;
+}
+
+/**
+ * Commits what a relay changed, on the current branch, and nothing else.
+ * Only the files that differ between the run's first and last snapshots are staged
+ * and committed, so unrelated work you had in progress stays untouched. Returns
+ * { committed: true, sha, files } or { committed: false, reason }; it never forces
+ * anything (hooks run) and it leaves the working tree alone if it cannot commit.
+ */
+export function commitRun(cwd, { baseTree, finalTree, headAtStart, message }) {
+  if (!isGitRepo(cwd)) return { committed: false, reason: "this folder is not a git repository" };
+  if (!baseTree || !finalTree || !headAtStart) return { committed: false, reason: "the repository has no commit to build on, or snapshots were unavailable" };
+  if (headSha(cwd) !== headAtStart) return { committed: false, reason: "HEAD moved while the relay ran" };
+  if (!gitRun(cwd, ["symbolic-ref", "-q", "HEAD"]).ok) return { committed: false, reason: "HEAD is detached" };
+  const busy = ["MERGE_HEAD", "rebase-merge", "rebase-apply", "CHERRY_PICK_HEAD"]
+    .some((name) => existsSync(path.resolve(cwd, git(cwd, ["rev-parse", "--git-path", name])?.trim() || "")));
+  if (busy) return { committed: false, reason: "a merge, rebase or cherry-pick is in progress" };
+
+  const touched = nameList(gitRun(cwd, ["diff", "--name-only", "-z", baseTree, finalTree]).stdout);
+  if (!touched.length) return { committed: false, reason: "the relay changed no files" };
+  const alreadyDirty = new Set(nameList(gitRun(cwd, ["diff", "--name-only", "-z", headAtStart, baseTree]).stdout));
+  const overlap = touched.filter((file) => alreadyDirty.has(file));
+  if (overlap.length) {
+    return { committed: false, reason: `you already had uncommitted changes in ${overlap.slice(0, 3).join(", ")}${overlap.length > 3 ? " and more" : ""}, which a commit would mix with the relay's` };
+  }
+  for (let i = 0; i < touched.length; i += 200) {
+    const staged = gitRun(cwd, ["add", "-A", "--", ...touched.slice(i, i + 200)]);
+    if (!staged.ok) { gitRun(cwd, ["reset", "-q", "--", ...touched]); return { committed: false, reason: `git add failed: ${staged.stderr.split("\n")[0]}` }; }
+  }
+  const commit = gitRun(cwd, ["commit", "-q", "-m", message, "--", ...touched]);
+  if (!commit.ok) {
+    gitRun(cwd, ["reset", "-q", "--", ...touched]);
+    return { committed: false, reason: `git commit failed (a hook may have rejected it): ${(commit.stderr || commit.stdout).split("\n")[0]}` };
+  }
+  return { committed: true, sha: headSha(cwd), files: touched };
 }

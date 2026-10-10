@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { createTickets, readTicket, updateTicket } from "../src/board.mjs";
-import { diffTrees, excludeBoardLocally, saveCheckpoint, snapshotTree } from "../src/gitdiff.mjs";
+import { commitRun, diffTrees, excludeBoardLocally, headSha, saveCheckpoint, snapshotTree } from "../src/gitdiff.mjs";
 import { detectInstalled, parseSelection } from "../src/harnesses.mjs";
 
 const git = (cwd, ...args) => execFileSync("git", args, { cwd, encoding: "utf8" });
@@ -90,4 +90,74 @@ test("installed harnesses are detected from PATH", async () => {
   for (const bin of ["codex", "claude"]) { await writeFile(path.join(dir, bin), "#!/bin/sh\n", { mode: 0o755 }); }
   await writeFile(path.join(dir, "gemini"), "not executable", { mode: 0o644 });
   assert.deepEqual(detectInstalled(dir), ["claude", "codex"]);
+});
+
+async function relayEdit(cwd, edit) {
+  const baseTree = await snapshotTree(cwd);
+  const headAtStart = headSha(cwd);
+  await edit();
+  return { baseTree, headAtStart, finalTree: await snapshotTree(cwd), message: "Relay: change\n\n- task" };
+}
+
+test("commitRun commits only what the relay changed, leaving unrelated work alone", async () => {
+  const cwd = await repo();
+  await writeFile(path.join(cwd, "mine.txt"), "my own work in progress\n"); // untracked, present before the run
+  const run = await relayEdit(cwd, async () => {
+    await writeFile(path.join(cwd, "a.txt"), "one\ntwo\n");
+    await writeFile(path.join(cwd, "new.txt"), "new\n");
+  });
+  const result = commitRun(cwd, run);
+  assert.equal(result.committed, true);
+  assert.deepEqual(result.files.sort(), ["a.txt", "new.txt"]);
+  assert.equal(git(cwd, "log", "-1", "--format=%s"), "Relay: change\n");
+  assert.equal(git(cwd, "show", "--name-only", "--format=", "HEAD").trim().split("\n").sort().join(), "a.txt,new.txt");
+  assert.equal(git(cwd, "status", "--porcelain").trim(), "?? mine.txt");
+});
+
+test("commitRun handles deletions and subdirectories", async () => {
+  const cwd = await repo();
+  const run = await relayEdit(cwd, async () => {
+    await (await import("node:fs/promises")).mkdir(path.join(cwd, "src"));
+    await writeFile(path.join(cwd, "src", "x.txt"), "x\n");
+    await (await import("node:fs/promises")).rm(path.join(cwd, "a.txt"));
+  });
+  assert.equal(commitRun(cwd, run).committed, true);
+  assert.equal(git(cwd, "status", "--porcelain"), "");
+});
+
+test("commitRun refuses to mix the relay's edits with yours in the same file", async () => {
+  const cwd = await repo();
+  await writeFile(path.join(cwd, "a.txt"), "one\nmy edit\n"); // dirty before the run
+  const run = await relayEdit(cwd, () => writeFile(path.join(cwd, "a.txt"), "one\nmy edit\nrelay edit\n"));
+  const result = commitRun(cwd, run);
+  assert.equal(result.committed, false);
+  assert.match(result.reason, /a\.txt/);
+  assert.equal(git(cwd, "log", "--oneline").trim().split("\n").length, 1);
+});
+
+test("commitRun skips when HEAD moved, HEAD is detached, or nothing changed", async () => {
+  let cwd = await repo();
+  let run = await relayEdit(cwd, async () => {
+    await writeFile(path.join(cwd, "n.txt"), "n\n");
+    git(cwd, "add", "n.txt"); git(cwd, "commit", "-qm", "harness committed on its own");
+  });
+  assert.match(commitRun(cwd, run).reason, /HEAD moved/);
+  cwd = await repo();
+  run = await relayEdit(cwd, () => writeFile(path.join(cwd, "n.txt"), "n\n"));
+  git(cwd, "checkout", "-q", "--detach");
+  assert.match(commitRun(cwd, run).reason, /detached/);
+  cwd = await repo();
+  run = await relayEdit(cwd, async () => {});
+  assert.match(commitRun(cwd, run).reason, /no files/);
+});
+
+test("a rejecting hook leaves the work uncommitted and the index clean", async () => {
+  const cwd = await repo();
+  await writeFile(path.join(cwd, ".git/hooks/pre-commit"), "#!/bin/sh\necho nope >&2\nexit 1\n", { mode: 0o755 });
+  const run = await relayEdit(cwd, () => writeFile(path.join(cwd, "n.txt"), "n\n"));
+  const result = commitRun(cwd, run);
+  assert.equal(result.committed, false);
+  assert.match(result.reason, /hook/);
+  assert.equal(git(cwd, "diff", "--cached", "--name-only"), "");
+  assert.equal(git(cwd, "status", "--porcelain").trim(), "?? n.txt");
 });

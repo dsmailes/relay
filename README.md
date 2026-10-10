@@ -1,28 +1,50 @@
 # Herdr Harness Relay
 
-Harness Relay passes a coding change between several coding harnesses inside Herdr, like a baton. You describe the change to the first harness and approve its plan. Relay then has the next harness implement each task, the one after review it, and keeps rotating. Roles belong to workflow steps, not to particular harnesses.
+Harness Relay passes a coding change between several AI coding tools inside [Herdr](https://herdr.dev), like a baton in a relay race. You describe the change to the first tool and approve its plan. Relay then hands each task to the next tool to implement, the one after that to review, and keeps rotating. When everything is reviewed, Relay commits the result.
+
+A few words used throughout:
+
+- **Harness**: an AI coding tool such as Claude Code, Codex or OpenCode.
+- **Relay**: one complete change, from your first message to the commit.
+- **Baton**: whose turn it is. It moves to the next harness at every step, so no harness reviews its own work.
+
+```mermaid
+sequenceDiagram
+    actor You
+    participant A as Claude Code
+    participant B as Codex
+    participant C as OpenCode
+    You->>A: describe the change, agree and approve the plan
+    A->>B: implement task 1
+    B->>C: review task 1
+    C->>A: changes requested, fix them
+    A->>B: review the fix
+    B->>C: approved, implement task 2
+    C->>A: review task 2
+    A-->>You: all tasks approved, committed
+```
+
+The example uses three harnesses. With two, they simply alternate. Optional design-review and second-opinion steps, when the planner asks for them, take the next turns before task 1.
 
 ## Quick start
 
-You need Herdr `0.7.3` or newer, Node.js `20` or newer, and at least two supported harnesses (Claude Code, Codex, OpenCode and so on) that are installed and signed in.
+You need Herdr `0.7.3` or newer, Node.js `20` or newer, a git repository for your project, and at least two harnesses that are installed and signed in.
 
 ```sh
 herdr plugin install dsmailes/relay
 ```
 
-Then, in a Herdr workspace opened at your project, run this in any terminal pane:
+Open a Herdr workspace at your project, then run this in any terminal pane:
 
 ```sh
 herdr plugin action invoke community.harness-relay.open-relay
 ```
 
-A **Harness Relay** tab opens. On first run Relay lists the harnesses it found on your `PATH` and suggests a rotation. Press **Enter** to accept it (or type the kinds or numbers you want). Relay then opens the first harness in a focused tab. Talk to it, agree a plan, and approve it. That is the whole setup.
+On first run Relay lists the harnesses it found on your `PATH` and suggests a rotation. Press **Enter** to accept it, or type the names or numbers you prefer. Relay then opens the first harness in a new tab. Tell it what you want changed, agree a plan, and approve it. Relay takes over from there.
 
-Next time, the only prompt is "Press Enter to start".
+Next time the only prompt is "Press Enter to start". Type `change` there to pick different harnesses.
 
-### Optional: a keyboard shortcut
-
-Plugins cannot register their own keys, but you can bind one in Herdr's `config.toml`:
+Optional keyboard shortcut. Plugins cannot register keys themselves, but you can add this to Herdr's `config.toml`:
 
 ```toml
 [[keys.command]]
@@ -32,51 +54,106 @@ command = "community.harness-relay.open-relay"
 description = "Harness Relay"
 ```
 
-## What happens
+## What you will see
+
+Relay uses two kinds of tab. You only type in the second.
 
 ```text
-you + first harness: discuss and approve the plan
-  → [optional design review → planner revision]
-  → [optional second opinion → optional plan revision]
-  → [your approval, only if the plan changed]
-  → for each task: implement → review → (changes requested → implement → review, up to 3 rounds)
-  → next task → … → complete
+┌─ Tab "Harness Relay" ───────────────┐   ┌─ Tab "Relay claude 1a2b3c4d" ─────────┐
+│ Run 1a2b3c4d: Add insurance report  │   │ Claude Code                            │
+│   ✓ plan                            │   │                                        │
+│   ✓ task 1/3: Report model          │   │ > describe your change here,           │
+│   ▸ task 2/3: PDF renderer          │   │   agree the plan, approve it           │
+│   · task 3/3: Share sheet           │   │                                        │
+│   waiting on: reviewer (opencode)   │   │                                        │
+└─────────────────────────────────────┘   └────────────────────────────────────────┘
+   status board: read it, don't type          the active harness: this is where you talk
 ```
 
-Each handoff moves to the **next harness in the rotation**. With Claude Code, Codex and OpenCode selected, Claude Code plans, Codex implements task 1, OpenCode reviews it, Claude Code implements the next task or the fixes, and so on. After the last task the baton returns to the first harness for your next change.
+- **The Harness Relay tab** is the coordinator. It shows a checklist and asks the occasional question. Leave it running.
+- **The harness tab** is a normal session of whichever harness holds the baton. Only one is open at a time: when the next harness starts, the previous tab closes.
 
-Things Relay does for you:
+A typical relay:
 
-- **Briefs each harness.** Every step starts a fresh harness session, so Relay passes everything it needs: the agreed brief, the task, the Livestock ticket history, and for reviewers the exact diff.
-- **Shows reviewers only the task's diff.** Relay snapshots the working tree before and after each task (without touching your index, branch or HEAD) and gives the reviewer that diff. Your own uncommitted work and earlier tasks are excluded. The full diffs are kept in the plugin state directory.
-- **Keeps checkpoints.** After each approved task Relay saves a commit under `refs/relay/<run>/task-N`. Your branch is never moved, and you can diff or restore from these at any time. Changes stay uncommitted in your working tree until you commit them.
-- **Corrects bad handoffs.** If a harness answers in the wrong shape (or prints the plan handoff before you approved), Relay tells it what was wrong and asks again, up to three times.
-- **Never gives up on a permission prompt.** If a harness is blocked on a permission or question, Relay notifies you and waits. If one stops without its handoff line, Relay reminds it once, and resends a prompt that never registered.
-- **Keeps `.herdr-issues.json` out of your way.** The board is added to your local `.git/info/exclude`, so it does not show up in `git status` or in reviewers' diffs.
+1. You talk to the first harness until the plan is right, then approve it. (Relay knows you approved because the harness hands it the plan.)
+2. Relay hands out tasks. You can watch, or leave. If a harness needs a permission or answer, Relay sends a notification and waits for you in that harness's tab.
+3. When every task is reviewed and approved, Relay commits the result and the baton returns to the first harness for your next change.
 
-Only the active harness tab stays open; the previous one closes once the next harness has started.
+## Safety: what Relay touches
 
-## Progress, recovery and history
+- **Harnesses edit your real working directory**, with whatever permissions you have given them. There is no separate copy or worktree. Start from a clean or committed state when you can.
+- **Relay commits once per finished relay**, on your current branch, containing only the files the relay changed. It never pushes. Hooks run normally, and Relay never bypasses them.
+- **Relay skips the commit, and says why,** if it cannot do it safely: you had uncommitted edits in a file the relay also changed, HEAD moved during the run, HEAD is detached, a merge or rebase is in progress, a hook rejected it, or the folder is not a git repository. Your work stays in the working tree.
+- **Your other uncommitted work is never swept into the commit.** To turn automatic commits off, set `"autoCommit": false` in `harnesses.json` in the plugin config directory (`herdr plugin config-dir community.harness-relay`).
+- **Checkpoints.** After each approved task Relay also saves a hidden commit under `refs/relay/<run>/task-N`. They never move your branch, and you can diff against or restore from them.
+- Relay adds `.herdr-issues.json` to your local `.git/info/exclude` so the ticket board does not clutter `git status`.
 
-Relay records progress in three places, all written as it goes:
+## Watching progress
 
-| Where | What | Use it for |
-| --- | --- | --- |
-| The coordinator tab | A live checklist: plan, each task (`✓` done, `▸` current, `·` waiting) and who Relay is waiting on | Seeing where you are |
-| Livestock tickets (`.herdr-issues.json`) | A parent ticket and one per task, with status, every baton pass, implementation summaries and review findings, and a final timeline | Project-visible history |
-| Plugin state directory (on macOS and Linux: `~/.config/herdr/plugins/state/community.harness-relay/`) | `<key>.json` current run; `<key>.events.jsonl` append-only log of every step, rejection, pause and error across all runs; `runs/<run>.json` final snapshot of each finished or abandoned run; `diffs/*.patch` what each reviewer saw. `<key>` is a short hash of the project path | Auditing and debugging |
+Relay keeps three records, all updated as it goes.
 
-**Resuming.** Every step's result is stored, so any interruption is recoverable: closing the tab, a crash, a pause. Start Relay again and press Enter to resume. Relay re-reads the waiting harness's pane instead of resending its prompt, and skips everything already finished. If the harness pane itself is gone, Relay starts a fresh one and resends.
+| Where | What it holds |
+| --- | --- |
+| The Harness Relay tab | The live checklist above |
+| The Livestock board | A ticket for the change and one per task, with status, each baton pass, summaries and review findings |
+| The plugin state directory | An append-only log of every step across all runs, a snapshot of each finished run, and the exact diffs reviewers saw |
 
-When something needs you, the coordinator shows a menu: **Enter** keeps waiting, `resend` sends the prompt again with a fresh marker, `stop` exits and keeps the state. After three rejected reviews of one task you can allow `more` rounds, `accept` the work as it is, or `stop`.
+**Livestock** is an optional separate Herdr plugin that displays `.herdr-issues.json`. With it installed, press `prefix+i` in your project's workspace to open the live board beside your panes; it updates as tickets move. Without Livestock Relay still works, and the JSON file is there to read.
 
-A project lock prevents two Relay coordinators on the same checkout. If a crash left a stale lock, Relay detects the dead process and clears it itself.
+The state directory is `~/.local/state/herdr/plugins/community.harness-relay/` (the path Herdr passes to Relay as `HERDR_PLUGIN_STATE_DIR`). Its files are named by a short hash of your project path: `<key>.json` (current run), `<key>.events.jsonl` (the log), `runs/<run>.json` and `diffs/*.patch`.
 
-## Handoff lines
+## Stopping and resuming
 
-Harnesses finish each step with one line. The marker token is generated per prompt.
+Every step's result is saved, so you can close the tab, lose power, or hit an error and carry on. Run the action again and press **Enter** at "resume this run". Relay re-reads the waiting harness's tab instead of resending its prompt. If that tab is gone, it starts a fresh harness and resends.
 
-| Step | Line |
+When something needs you, the Harness Relay tab shows a menu:
+
+- **Enter**: keep waiting.
+- `resend`: send the prompt to the harness again.
+- `stop`: exit and keep everything for later.
+
+After three review rounds on one task you can also choose `more` rounds, or `accept` the work as it is.
+
+Only one Relay can run per project at a time. If a crash left a stale lock, Relay notices the dead process and clears it.
+
+## Troubleshooting
+
+**I approved the plan and nothing happened.** Open the Harness Relay tab: it should say it is waiting on the harness. If you are on an older install, update the plugin, stop the coordinator tab with `Ctrl+C`, run the action again and press Enter to resume. Very long plans were not recognised by early versions.
+
+**"Saved run was made by an older Relay version."** Type `new` to drop it. Anything it already changed stays in your working tree, so check `git status` first.
+
+**The action is missing.** Run `herdr plugin list` and `herdr plugin action list --plugin community.harness-relay`. If it is absent, install again. To run from a local checkout use `herdr plugin link /path/to/relay` (if the plugin is already linked, `install` will refuse; the link is already enough).
+
+**A harness does not start.** Check it works in a normal terminal and is signed in. Relay waits up to three minutes (first-run dialogs can be slow), then shows the menu.
+
+**A step seems stuck.** Look at the active harness tab. If it is waiting on a permission or a question, answer it there and Relay continues. A harness that stops without handing off gets one reminder from Relay.
+
+**"Could not resolve the project directory."** Run the action from the workspace you want to change.
+
+**"Not committed: …"** The reason follows. Commit the files yourself when ready.
+
+## Reference
+
+### Supported harnesses
+
+Rotation follows this order. Herdr must recognise the kind, and the program must be installed. Relay does not install or sign in harnesses.
+
+| | | | |
+| --- | --- | --- | --- |
+| Claude Code `claude` | Codex `codex` | OpenCode `opencode` | GitHub Copilot CLI `copilot` |
+| Pi `pi` | Gemini CLI `gemini` | Cursor Agent `cursor` | Amp `amp` |
+| Droid `droid` | Kimi Code `kimi` | Kiro CLI `kiro` | Cline `cline` |
+| Devin CLI `devin` | Antigravity CLI `agy` | Hermes Agent `hermes` | Kilo Code CLI `kilo` |
+| Qoder CLI `qodercli` | Qwen Code `qwen` | MastraCode `mastracode` | Grok CLI `grok` |
+| OMP `omp` | Maki `maki` | Letta Code `letta` | Muse `muse` |
+
+### How hand-offs work
+
+Each step starts a fresh harness session, so Relay gives it everything it needs: the agreed brief, the task and acceptance criteria, the ticket history, and for reviewers the exact diff of that task. Reviewers see only that task's changes, not your other work. They come from snapshots taken before and after each task, without touching your index, branch or HEAD.
+
+A harness finishes each step with one **hand-off line** that Relay reads from its tab. Every prompt gets its own random token so old output is never mistaken for a new answer.
+
+| Step | Hand-off line |
 | --- | --- |
 | Plan (first harness) | `RELAY_PLAN_<token>: {"title":…,"request":…,"approvedByUser":true,"needsDesignReview":…,"needsSecondOpinion":…,"tasks":[…]}` |
 | Plan approval after revision | `RELAY_APPROVAL_<token>: {"decision":"approve","tasks":[…]}` |
@@ -86,34 +163,16 @@ Harnesses finish each step with one line. The marker token is generated per prom
 | Implementation | `RELAY_IMPLEMENTATION_<token>: {"status":"complete"\|"blocked","summary":…}` |
 | Review | `RELAY_REVIEW_<token>: {"decision":"approve"}` or `{"decision":"changes","findings":…}` |
 
-Relay tolerates terminal decoration (bullets, borders, backticks, wrapped lines). Prompt templates are deliberately not valid JSON, so an echoed prompt can never be read as an answer. A plan needs 1 to 20 tasks, each with `title` and `acceptanceCriteria`.
+If a harness answers in the wrong shape, Relay says what was wrong and asks again, up to three times. A plan has 1 to 20 tasks, each with a `title` and `acceptanceCriteria`. Because later harnesses never see your conversation, the planner writes `request` as a self-contained brief, and the better that brief is, the better the later steps do.
 
-Because every harness starts fresh, the first harness is told to write `request` as a self-contained brief (goal, constraints, decisions, non-goals). The better that brief, the better later steps do.
+### Development
 
-## Supported harnesses
+Dependency-free Node.js.
 
-Claude Code (`claude`), Codex (`codex`), OpenCode (`opencode`), GitHub Copilot CLI (`copilot`), Pi (`pi`), Gemini CLI (`gemini`), Cursor Agent (`cursor`), Amp (`amp`), Droid (`droid`), Kimi Code (`kimi`), Kiro CLI (`kiro`), Cline (`cline`), Devin CLI (`devin`), Antigravity CLI (`agy`), Hermes Agent (`hermes`), Kilo Code CLI (`kilo`), Qoder CLI (`qodercli`), Qwen Code (`qwen`), MastraCode (`mastracode`), Grok CLI (`grok`), OMP (`omp`), Maki (`maki`), Letta Code (`letta`) and Muse (`muse`). Herdr must recognise the kind and the executable must be installed. Rotation follows this list's order.
-
-Relay does not install or sign in harnesses. To change your selection later, type `change` at the start prompt.
-
-## Troubleshooting
-
-**The action is missing.** Run `herdr plugin list` and `herdr plugin action list --plugin community.harness-relay`. If it is absent, install again (`herdr plugin link /path/to/relay` for a local checkout).
-
-**A harness does not start.** Check it runs in a normal terminal and is signed in. Relay waits up to three minutes for it to become ready (first-run dialogs can be slow), then offers the pause menu.
-
-**A step seems stuck.** Look at the focused worker tab. If the harness is waiting on a permission or a question, answer it there; Relay continues. Otherwise use the menu options above.
-
-**"Relay cannot resolve the project directory."** Invoke the action from the workspace you want to change.
-
-## Development
-
-Dependency-free Node.js. Layout:
-
-- `src/relay-console.mjs`: the coordinator (step runner, pause menu, task loop).
+- `src/relay-console.mjs`: the coordinator (step runner, pause menu, task loop, final commit).
 - `src/steps.mjs`: prompts and answer validation for every step.
-- `src/markers.mjs`: handoff-line parser.
-- `src/gitdiff.mjs`: non-invasive snapshots, diffs and checkpoints.
+- `src/markers.mjs`: hand-off line parser.
+- `src/gitdiff.mjs`: snapshots, diffs, checkpoints and the final commit.
 - `src/board.mjs`: locked Livestock board updates.
 - `src/store.mjs`: state, event log, run history, project lock.
 - `src/harnesses.mjs`: harness list and PATH detection.
@@ -123,4 +182,4 @@ Dependency-free Node.js. Layout:
 npm test
 ```
 
-The suite includes an end-to-end test that drives the real coordinator against a fake `herdr` binary (`test/fake-herdr.mjs`), including a kill and resume mid-review. It does not exercise real harnesses.
+The suite includes an end-to-end test that drives the real coordinator against a fake `herdr` binary (`test/fake-herdr.mjs`), including a kill and resume mid-review and the final commit. It does not exercise real harnesses.
