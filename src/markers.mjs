@@ -14,7 +14,7 @@ const KNOWN_KEYS = new Set([
   "status", "summary", "testsRun",
 ]);
 const STOP_ROW = /^(?:[*•●◦⏺✦▪■‣·✻❯›]|RELAY_[A-Z0-9_]+_[0-9a-f]{8}:|```)/;
-const MAX_CONTINUATION_ROWS = 60;
+const MAX_CONTINUATION_ROWS = 400; // a real brief plus tasks hard-wraps to 80+ rows
 
 function cleanRow(line) {
   return line.replace(/\r/g, "").replace(BORDER_LEAD, "").replace(BORDER_TRAIL, "");

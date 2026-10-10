@@ -40,6 +40,9 @@ let inputClosed = false;
 input.on("line", (line) => { if (waiting) { const resolve = waiting; waiting = null; resolve(line); } else queued.push(line); });
 input.on("close", () => { inputClosed = true; if (waiting) { const resolve = waiting; waiting = null; resolve(null); } });
 let currentState = null;
+// Ctrl+C or a closed tab stops the coordinator; progress is already saved and a stale lock is cleared on the next start.
+input.on("SIGINT", () => { stdout.write("\nStopped. Progress is saved; start Harness Relay again to resume.\n"); process.exit(130); });
+process.on("SIGTERM", () => process.exit(143));
 
 const out = (text = "") => stdout.write(`${text}\n`);
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -184,7 +187,7 @@ async function deliver(state, p, text) {
 }
 
 function readMarker(name, marker) {
-  const recent = callHerdr(["agent", "read", name, "--source", "recent-unwrapped", "--lines", "200"], { allowFailure: true });
+  const recent = callHerdr(["agent", "read", name, "--source", "recent-unwrapped", "--lines", "800"], { allowFailure: true });
   const value = extractMarker(recent.stdout, marker);
   if (value !== null) return value;
   // Some TUIs keep the finished reply in the visible screen but not in scrollback.

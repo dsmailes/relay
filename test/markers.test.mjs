@@ -42,3 +42,13 @@ test("incomplete or non-object payloads return null", () => {
 test("wrapping stops at the next message", () => {
   assert.equal(extractMarker(`${M} {"decision":\n⏺ later text "approve"}`, M), null);
 });
+
+test("a long brief that hard-wraps over 100 rows still parses (regression: plan was never picked up)", () => {
+  const words = Array.from({ length: 1800 }, (_, i) => `word${i}`).join(" ");
+  const json = JSON.stringify({ title: "T", request: words, approvedByUser: true, tasks: [{ title: "a", acceptanceCriteria: "b" }] });
+  const wrapped = json.match(/.{1,95}(\s|$)/g).map((row) => `  ${row.trim()}`);
+  wrapped[0] = `  ${M} ${wrapped[0].trim()}`;
+  const value = extractMarker(["earlier chatter", ...wrapped, "", "✻ Baked for 13s", "❯ next"].join("\n"), M);
+  assert.equal(value.request, words);
+  assert.ok(wrapped.length > 100);
+});
