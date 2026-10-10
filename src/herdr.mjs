@@ -7,6 +7,7 @@ export function callHerdr(args, { allowFailure = false } = {}) {
     encoding: "utf8",
     windowsHide: true,
     env: process.env,
+    maxBuffer: 32 * 1024 * 1024,
   });
   if (result.error) throw new Error(`Could not run Herdr: ${result.error.message}`);
   if (result.status !== 0 && !allowFailure) {
@@ -22,6 +23,19 @@ export function herdrJson(args) {
   } catch {
     throw new Error(`Herdr returned invalid JSON for: herdr ${args.join(" ")}`);
   }
+}
+
+// Returns the agent record (agent_status, state_change_seq, ...) or null when
+// Herdr no longer knows the agent, for example after its tab was closed.
+export function getAgent(name) {
+  const result = callHerdr(["agent", "get", name], { allowFailure: true });
+  if (result.status !== 0) return null;
+  try { return JSON.parse(result.stdout)?.result?.agent ?? null; }
+  catch { return null; }
+}
+
+export function notify(title, body, sound = "request") {
+  callHerdr(["notification", "show", title, "--body", body, "--sound", sound], { allowFailure: true });
 }
 
 export function requireHerdrPaneContext() {

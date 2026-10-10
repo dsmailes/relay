@@ -1,6 +1,6 @@
 id = "community.harness-relay"
 name = "Harness Relay"
-version = "0.1.0"
+version = "0.2.0"
 min_herdr_version = "0.7.3"
 description = "Plan, implement, and review a change across coding harnesses"
 platforms = ["linux", "macos", "windows"]
