@@ -146,12 +146,13 @@ export function approvalStep({ request, original, tasks, designNote, findings })
   };
 }
 
-export function implementationStep({ key, ticket, index, total, task, findings, hasGit }) {
+export function implementationStep({ key, ticket, parent, index, total, task, findings, hasGit }) {
   return {
     key, role: "implementer", shape: shapes.implementation, ticketId: ticket?.id,
     intro: [
       FRESH_SESSION,
-      `Implement task ${index + 1} of ${total}. Work only on this task's acceptance criteria.`,
+      parent ? `User-facing work item: ${parent.label}. This is implementation step ${index + 1} of ${total} within that work item.` : `Implement task ${index + 1} of ${total}.`,
+      "Work only on this step's acceptance criteria. It is one part of the larger requested work item; do not describe the parent work item as complete. In your summary, say this implementation step is complete and awaiting review.",
       formatTask(task, index),
       findings ? `A reviewer asked for these changes in the previous round. Address them:\n${findings}` : "",
       "Run the project's relevant tests or build if it has them, and fix what you break. Leave your changes uncommitted in the working tree" +
@@ -168,7 +169,7 @@ export function implementationStep({ key, ticket, index, total, task, findings, 
   };
 }
 
-export function reviewStep({ key, ticket, index, total, task, summary, diff }) {
+export function reviewStep({ key, ticket, parent, index, total, task, summary, diff }) {
   const diffText = !diff
     ? "Relay could not compute a diff (the project is not a git repository). Inspect the working tree."
     : [
@@ -180,7 +181,7 @@ export function reviewStep({ key, ticket, index, total, task, summary, diff }) {
     key, role: "reviewer", shape: shapes.review, ticketId: ticket?.id,
     intro: [
       FRESH_SESSION,
-      `Review task ${index + 1} of ${total}.`, formatTask(task, index),
+      parent ? `Review implementation step ${index + 1} of ${total} for ${parent.label}. The parent work item is not complete until every step is approved.` : `Review task ${index + 1} of ${total}.`, formatTask(task, index),
       summary ? `The implementer reports:\n${summary}` : "",
       diffText,
       "Check correctness, the acceptance criteria and obvious regressions. You may read any file and run tests, but do not edit files. Approve only if every acceptance criterion is met.",

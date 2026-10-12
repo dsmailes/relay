@@ -15,13 +15,13 @@ sequenceDiagram
     participant B as Codex
     participant C as OpenCode
     You->>A: describe the change, agree and approve the plan
-    A->>B: implement task 1
-    B->>C: review task 1
+    A->>B: implement step 1
+    B->>C: review step 1
     C->>A: changes requested, fix them
     A->>B: review the fix
-    B->>C: approved, implement task 2
-    C->>A: review task 2
-    A-->>You: all tasks approved, committed
+    B->>C: approved, implement step 2
+    C->>A: review step 2
+    A-->>You: all steps approved, committed
 ```
 
 The example uses three harnesses. With two, they simply alternate. Optional design-review and second-opinion steps, when the planner asks for them, take the next turns before task 1.
@@ -60,11 +60,11 @@ Relay uses two kinds of tab. You only type in the second.
 
 ```text
 ┌─ Tab "Harness Relay" ───────────────┐   ┌─ Tab "Relay claude 1a2b3c4d" ─────────┐
-│ Run 1a2b3c4d: Add insurance report  │   │ Claude Code                            │
+│ Insurance report [TASK-016]          │   │ Claude Code                            │
 │   ✓ plan                            │   │                                        │
-│   ✓ task 1/3: Report model          │   │ > describe your change here,           │
-│   ▸ task 2/3: PDF renderer          │   │   agree the plan, approve it           │
-│   · task 3/3: Share sheet           │   │                                        │
+│   ✓ Report model                    │   │ > describe your change here,           │
+│   ▸ PDF renderer (in progress)       │   │   agree the plan, approve it           │
+│   · Share sheet                     │   │                                        │
 │   waiting on: reviewer (opencode)   │   │                                        │
 └─────────────────────────────────────┘   └────────────────────────────────────────┘
    status board: read it, don't type          the active harness: this is where you talk
@@ -76,8 +76,8 @@ Relay uses two kinds of tab. You only type in the second.
 A typical relay:
 
 1. You talk to the first harness until the plan is right, then approve it. (Relay knows you approved because the harness hands it the plan.)
-2. Relay hands out tasks. You can watch, or leave. If a harness needs a permission or answer, Relay sends a notification and waits for you in that harness's tab.
-3. When every task is reviewed and approved, Relay commits the result and the baton returns to the first harness for your next change.
+2. Relay hands out implementation steps. You can watch, or leave. If a harness needs a permission or answer, Relay sends a notification and waits for you in that harness's tab.
+3. When every implementation step is reviewed and approved, Relay commits the result and the baton returns to the first harness for your next change.
 
 ## Safety: what Relay touches
 
@@ -95,10 +95,12 @@ Relay keeps three records, all updated as it goes.
 | Where | What it holds |
 | --- | --- |
 | The Harness Relay tab | The live checklist above |
-| The Livestock board | A ticket for the change and one per task, with status, each baton pass, summaries and review findings |
+| The Livestock board | The matching parent ticket for the change, with linked implementation steps, baton passes, summaries and review findings |
 | The plugin state directory | An append-only log of every step across all runs, a snapshot of each finished run, and the exact diffs reviewers saw |
 
 **Livestock** is an optional separate Herdr plugin that displays `.herdr-issues.json`. With it installed, press `prefix+i` in your project's workspace to open the live board beside your panes; it updates as tickets move. Without Livestock Relay still works, and the JSON file is there to read.
+
+When the approved request names an existing ticket key (for example, `TASK-016`), Relay attaches its implementation steps to that ticket instead of creating a duplicate parent. The live board shows those steps nested under the parent. Progress messages and the final commit identify the parent request; an individual step being approved does not mean the whole ticket is complete.
 
 The state directory is `~/.local/state/herdr/plugins/community.harness-relay/` (the path Herdr passes to Relay as `HERDR_PLUGIN_STATE_DIR`). Its files are named by a short hash of your project path: `<key>.json` (current run), `<key>.events.jsonl` (the log), `runs/<run>.json` and `diffs/*.patch`.
 

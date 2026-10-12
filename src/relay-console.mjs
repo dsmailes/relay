@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import path from "node:path";
 import readline from "node:readline";
 import { stdin, stdout } from "node:process";
-import { createTickets, readTicket, updateTicket } from "./board.mjs";
+import { createTickets, findTicketsByReference, readTicket, updateTicket } from "./board.mjs";
 import { commitRun, diffTrees, excludeBoardLocally, headSha, saveCheckpoint, snapshotTree } from "./gitdiff.mjs";
 import { callHerdr, getAgent, herdrJson, notify, requireHerdrPaneContext } from "./herdr.mjs";
 import { detectInstalled, harnesses, inRotationOrder, parseSelection } from "./harnesses.mjs";
@@ -102,13 +102,24 @@ async function record(state, entry) {
 }
 
 function printProgress(state) {
-  out(`\nRun ${short(state)}${state.title ? ` — ${state.title}` : ""}  (${state.harnessChain.join(" → ")})`);
+  const parentLabel = workItemLabel(state);
+  const approved = state.tasks.filter((_, index) => state.done[`task-${index}`]).length;
+  out(`\n${parentLabel}  (${state.harnessChain.join(" → ")})`);
+  out(`  ${approved}/${state.tasks.length} implementation steps approved`);
   out(`  ${state.done.intake ? "✓" : "▸"} plan`);
   state.tasks.forEach((task, i) => {
     const mark = state.done[`task-${i}`] ? "✓" : i === state.taskIndex ? "▸" : "·";
-    out(`  ${mark} task ${i + 1}/${state.tasks.length}: ${task.title}`);
+    out(`  ${mark} ${task.title}${i === state.taskIndex && !state.done[`task-${i}`] ? " (implementation/review in progress)" : ""}`);
   });
   if (state.pending) out(`  waiting on: ${state.pending.role} (${state.pending.harness})`);
+}
+
+function workItemLabel(state) {
+  const title = state.livestock?.parentTitle || state.title || "Relay change";
+  const key = state.livestock?.parentSourceId;
+  const id = state.livestock?.parentTicketId;
+  if (key && !title.toLowerCase().startsWith(String(key).toLowerCase())) return `${key}: ${title}`;
+  return id ? `${title} [${id}]` : title;
 }
 
 async function withBoard(state, fn) {
@@ -337,7 +348,7 @@ async function ticketHeader(state, ticketId) {
 
 function commitMessage(state) {
   return [
-    `${state.title}`, "",
+    `${workItemLabel(state)}`, "",
     ...state.tasks.map((task) => `- ${task.title}`), "",
     `Implemented and reviewed by Harness Relay run ${short(state)} (${state.harnessChain.join(" → ")}).`,
   ].join("\n");
@@ -381,11 +392,36 @@ async function planPhase(state) {
 async function ensureTickets(state) {
   if (state.livestock) return;
   try {
+    let parentTicketId;
+    const references = [...new Set(`${state.title}\n${state.changeRequest}`.match(/\b[A-Z][A-Z0-9]*-\d+\b/g) || [])];
+    for (const reference of references) {
+      const candidates = await findTicketsByReference(state.cwd, reference);
+      if (candidates.length === 1) {
+        parentTicketId = candidates[0].id;
+        out(`Attaching subtasks to existing Livestock ticket ${reference} (${candidates[0].id}).`);
+        break;
+      }
+      if (candidates.length > 1) {
+        out(`\nSeveral Livestock tickets match ${reference}:`);
+        candidates.forEach((candidate) => out(`  ${candidate.id}  ${candidate.title}${candidate.source_id ? ` (source ${candidate.source_id})` : ""}`));
+        while (true) {
+          const selection = await ask("Enter a ticket ID to use, or new to create a separate parent", "");
+          if (selection.toLowerCase() === "stop") throw new StopRun();
+          if (selection.toLowerCase() === "new") break;
+          const selected = candidates.find((candidate) => candidate.id === selection);
+          if (selected) { parentTicketId = selected.id; break; }
+          out("Enter one of the listed ticket IDs, or new.");
+        }
+        break;
+      }
+    }
     state.livestock = await createTickets({
-      cwd: state.cwd, runId: state.runId, title: state.title, request: state.changeRequest, tasks: state.tasks,
+      cwd: state.cwd, runId: state.runId, title: state.title, request: state.changeRequest,
+      tasks: state.tasks, parentTicketId,
     });
-    out(`Added a parent ticket and ${state.tasks.length} task ticket(s) to Livestock.`);
+    out(`Added ${state.tasks.length} implementation subtask(s) under ${workItemLabel(state)} in Livestock.`);
   } catch (error) {
+    if (error instanceof StopRun) throw error;
     state.livestock = { disabled: true };
     out(`Note: could not create Livestock tickets (${error.message}). Relay continues without them.`);
   }
@@ -396,6 +432,7 @@ async function runTask(state, index) {
   const tasks = state.tasks;
   const task = tasks[index];
   const ticketId = state.livestock.taskTicketIds?.[index];
+  const parent = { label: workItemLabel(state), id: state.livestock.parentTicketId };
   state.taskIndex = index;
   if (!(index in state.git.base)) {
     state.git.base[index] = await snapshotTree(state.cwd);
@@ -412,7 +449,7 @@ async function runTask(state, index) {
   let accepted = false;
   for (let round = 1; !accepted; round++) {
     if (round > (state.allowedRounds[index] ?? REVIEW_ROUNDS)) {
-      out(`\nTask ${index + 1} has used ${round - 1} implementation/review rounds without approval.`);
+      out(`\n${workItemLabel(state)} is awaiting approval of implementation step ${index + 1}/${tasks.length} after ${round - 1} review rounds.`);
       const answer = (await ask("more = allow 2 more rounds, accept = accept the work as it is, stop = exit and resume later", "stop")).toLowerCase();
       if (answer === "more") { state.allowedRounds[index] = (state.allowedRounds[index] ?? REVIEW_ROUNDS) + 2; await persist(state); }
       else if (answer === "accept") { accepted = true; await ticketNote(state, ticketId, "Accepted by the user after the review limit."); break; }
@@ -420,7 +457,7 @@ async function runTask(state, index) {
     }
     const findings = round > 1 ? state.done[`review-${index}-${round - 1}`]?.findings : null;
     const impl = await runStep(state, implementationStep({
-      key: `impl-${index}-${round}`, ticket: { id: ticketId }, index, total: tasks.length, task, findings, hasGit,
+      key: `impl-${index}-${round}`, ticket: { id: ticketId }, parent, index, total: tasks.length, task, findings, hasGit,
     }), {
       onStart: baton,
       onDone: (result) => ticketNote(state, ticketId, `Implementation round ${round}: ${result.summary}`, "in progress"),
@@ -436,7 +473,7 @@ async function runTask(state, index) {
       }
     }
     const review = await runStep(state, reviewStep({
-      key: reviewKey, ticket: { id: ticketId }, index, total: tasks.length, task, summary: impl.summary, diff,
+      key: reviewKey, ticket: { id: ticketId }, parent, index, total: tasks.length, task, summary: impl.summary, diff,
     }), {
       onStart: baton,
       onDone: (result) => ticketNote(state, ticketId,
@@ -449,17 +486,17 @@ async function runTask(state, index) {
   if (saveCheckpoint(state.cwd, tree, ref, `Harness Relay: ${task.title}`)) state.git.checkpoints[index] = ref;
   if (!(index + 1 in state.git.base)) state.git.base[index + 1] = tree;
   state.done[`task-${index}`] = true;
-  await ticketNote(state, ticketId, "Task approved.", "done");
+  await ticketNote(state, ticketId, `Implementation step ${index + 1} of ${tasks.length} approved for ${workItemLabel(state)}.`, "done");
   await persist(state);
   await logEvent(state, "task.done", { task: index + 1, checkpoint: state.git.checkpoints[index] || null });
-  out(`✓ Task ${index + 1}/${tasks.length} approved: ${task.title}`);
+  out(`✓ ${workItemLabel(state)} — implementation step ${index + 1}/${tasks.length} approved: ${task.title}`);
 }
 
 async function execute(state) {
   await excludeBoardLocally(state.cwd).catch(() => {});
   await planPhase(state);
   if (!state.announcedPlan) {
-    out(`\nApproved plan — ${state.title}\n${formatTasks(state.tasks)}`);
+    out(`\nApproved plan for ${workItemLabel(state)}\n${formatTasks(state.tasks)}`);
     state.announcedPlan = true;
     await persist(state);
   }
@@ -478,15 +515,15 @@ async function execute(state) {
   }
   const summary = state.timeline.map((entry) => `${entry.role} (${entry.harness}): ${entry.summary}`).join("\n");
   await withBoard(state, () => updateTicket(state.cwd, state.livestock.parentTicketId, {
-    status: "done", note: `All task tickets completed and reviewed.\n\nTimeline:\n${summary}`,
+    status: "done", note: `All ${state.tasks.length} implementation steps completed and reviewed.\n\nTimeline:\n${summary}`,
   }));
   state.stage = "complete";
   state.completedAt = new Date().toISOString();
   await archiveRun(state, "complete");
-  notify("Harness Relay change complete", `${state.tasks.length} task(s) implemented and reviewed`, "done");
-  out(`\nChange complete: ${state.title}`);
+  notify("Harness Relay change complete", `${state.tasks.length} implementation step(s) approved`, "done");
+  out(`\nComplete: ${workItemLabel(state)}`);
   const commit = state.done.commit;
-  out(`${state.tasks.length} task(s) implemented and reviewed.`);
+  out(`All ${state.tasks.length} implementation step(s) are implemented and reviewed.`);
   if (commit?.committed) out(`Committed ${commit.sha.slice(0, 8)} on your current branch (${commit.files.length} file(s)). Not pushed.`);
   else if (state.autoCommit) out(`Not committed: ${commit?.reason}. The changes are in your working tree.`);
   else out("Auto-commit is off; the changes are in your working tree, uncommitted.");
