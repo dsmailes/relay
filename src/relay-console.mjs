@@ -8,7 +8,7 @@ import { callHerdr, getAgent, herdrJson, notify, requireHerdrPaneContext } from 
 import { detectInstalled, harnesses, inRotationOrder, parseSelection } from "./harnesses.mjs";
 import { extractMarker } from "./markers.mjs";
 import {
-  RelayPause, approvalStep, designStep, formatTasks, implementationStep, intakeStep,
+  RelayBlocked, RelayPause, approvalStep, designStep, formatTasks, implementationStep, intakeStep,
   markerInstruction, opinionStep, revisionStep, reviewStep,
 } from "./steps.mjs";
 import {
@@ -162,6 +162,28 @@ async function ensureWorker(state, slot) {
   state.worker = { runId: state.runId, slot, tabId, paneId, agent };
   await persist(state);
   await logEvent(state, "worker.start", { harness: kind, agent, tabId });
+  const pluginId = process.env.HERDR_PLUGIN_ID || "community.harness-relay";
+  const timeline = callHerdr([
+    "plugin", "pane", "open",
+    "--plugin", pluginId,
+    "--entrypoint", "relay-timeline",
+    "--placement", "split",
+    "--target-pane", paneId,
+    "--direction", "right",
+    "--cwd", state.cwd,
+    "--no-focus",
+  ], { allowFailure: true });
+  if (timeline.status === 0) {
+    try {
+      const result = JSON.parse(timeline.stdout);
+      const timelinePane = result?.result?.pane?.pane_id;
+      await logEvent(state, "timeline.open", { paneId: timelinePane || null, workerPaneId: paneId });
+    } catch {
+      // Some Herdr versions return a human-readable success response.
+    }
+  } else {
+    out("Note: the activity panel could not be opened; Relay will continue without it.");
+  }
   if (previousTab && previousTab !== tabId) callHerdr(["tab", "close", previousTab], { allowFailure: true });
   return { created: true };
 }
@@ -281,7 +303,7 @@ async function pauseMenu(state, p, reason) {
  * stored in state.done, so re-running the same step after a restart returns instantly.
  * The prompt is sent at most once per marker; on resume Relay re-reads the pane instead.
  */
-async function runStep(state, spec, { onStart, onDone } = {}) {
+async function runStep(state, spec, { onStart, onDone, onBlocked } = {}) {
   if (state.done[spec.key] !== undefined) return state.done[spec.key];
   let p = state.pending?.key === spec.key ? state.pending : null;
   if (p) {
@@ -312,6 +334,7 @@ async function runStep(state, spec, { onStart, onDone } = {}) {
       try { result = spec.validate(value); }
       catch (error) {
         if (error instanceof RelayPause) {
+          if (error instanceof RelayBlocked) await onBlocked?.(error);
           // The reply was understood but needs a human (for example "blocked"). Rotate the
           // marker so that "keep waiting" does not re-read the same stale line forever.
           p.marker = newMarker(spec);
@@ -463,7 +486,14 @@ async function runTask(state, index) {
       key: `impl-${index}-${round}`, ticket: { id: ticketId }, parent, index, total: tasks.length, task, findings, hasGit,
     }), {
       onStart: baton,
-      onDone: (result) => ticketNote(state, ticketId, `Implementation round ${round}: ${brief(result)}`, "in progress"),
+      onBlocked: (error) => Promise.all([
+        ticketNote(state, ticketId, error.message, "blocked"),
+        ticketNote(state, parent.id, `Implementation step ${index + 1} is blocked: ${brief({ summary: error.message })}`, "blocked"),
+      ]),
+      onDone: (result) => Promise.all([
+        ticketNote(state, ticketId, `Implementation round ${round}: ${brief(result)}`, "in progress"),
+        ticketNote(state, parent.id, `Implementation step ${index + 1} resumed: ${brief(result)}`, "in progress"),
+      ]),
     });
     const reviewKey = `review-${index}-${round}`;
     let diff = null;

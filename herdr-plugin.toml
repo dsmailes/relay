@@ -16,3 +16,9 @@ id = "relay-console"
 title = "Harness Relay"
 placement = "tab"
 command = ["node", "src/relay-console.mjs"]
+
+[[panes]]
+id = "relay-timeline"
+title = "Relay Activity"
+placement = "split"
+command = ["node", "src/relay-timeline.mjs"]

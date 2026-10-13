@@ -56,28 +56,32 @@ description = "Harness Relay"
 
 ## What you will see
 
-Relay uses two kinds of tab. You only type in the second.
+Relay keeps its input console separate from the active harness. During a run, it opens a read-only activity pane beside the current harness and refreshes it as the baton moves.
 
 ```text
-┌─ Tab "Harness Relay" ───────────────┐   ┌─ Tab "Relay claude 1a2b3c4d" ─────────┐
-│ Insurance report [TASK-016]          │   │ Claude Code                            │
-│   ✓ plan                            │   │                                        │
-│   ✓ Report model                    │   │ > describe your change here,           │
-│   ▸ PDF renderer (in progress)       │   │   agree the plan, approve it           │
-│   · Share sheet                     │   │                                        │
-│   waiting on: reviewer (opencode)   │   │                                        │
-└─────────────────────────────────────┘   └────────────────────────────────────────┘
-   status board: read it, don't type          the active harness: this is where you talk
+┌─ Relay console ─────────────────────┐   ┌─ Relay Activity ──────────────────────┐
+│ waiting for the approved plan       │   │ Insurance report [TASK-016]           │
+│                                    │   │ ✓ Claude · plan · approved             │
+│                                    │   │ ● Codex · implement · PDF renderer    │
+│                                    │   │   active                               │
+└────────────────────────────────────┘   └────────────────────────────────────────┘
+                                             ┌─ active harness: Codex ─────────────┐
+                                             │ talk here if it asks a question      │
+                                             └──────────────────────────────────────┘
 ```
 
-- **The Harness Relay tab** is the coordinator. It shows a checklist and asks the occasional question. Leave it running.
-- **The harness tab** is a normal session of whichever harness holds the baton. Only one is open at a time: when the next harness starts, the previous tab closes.
+- **The Relay console** starts and resumes a run and handles its prompts. It is not a separate coordinator harness.
+- **The activity pane** is read-only. It shows the change, the harness rotation, completed and active steps, and each step's summary. It refreshes at every baton pass and follows the active harness tab.
+- **The harness pane** is where you talk to the current harness. Relay closes the previous harness tab when the next harness starts, so only one harness pane is active at a time.
+- Recognized harnesses get distinct icons. At completion the panel shows a podium; token ranks are marked unavailable until Herdr provides measured token totals.
 
 A typical relay:
 
 1. You talk to the first harness until the plan is right, then approve it. (Relay knows you approved because the harness hands it the plan.)
 2. Relay hands out implementation steps. You can watch, or leave. If a harness needs a permission or answer, Relay sends a notification and waits for you in that harness's tab.
 3. When every implementation step is reviewed and approved, Relay commits the result and the baton returns to the first harness for your next change.
+
+If an implementer reports `blocked`, Relay marks that subtask and its parent ticket `blocked` while it waits for you. When implementation resumes, Relay returns both tickets to `in progress` and records the handoff summary.
 
 ## Safety: what Relay touches
 

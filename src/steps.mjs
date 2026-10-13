@@ -6,6 +6,7 @@
 // template for a real answer.
 
 export class RelayPause extends Error {}
+export class RelayBlocked extends RelayPause {}
 
 const TASKS_SHAPE = '[{"title": <string>, "acceptanceCriteria": <string>}]';
 
@@ -187,7 +188,7 @@ export function implementationStep({ key, ticket, parent, index, total, task, fi
     validate(value) {
       if (!["complete", "blocked"].includes(value.status)) throw new Error('"status" must be "complete" or "blocked".');
       if (!isText(value.summary)) throw new Error('"summary" must say what changed and which tests ran.');
-      if (value.status === "blocked") throw new RelayPause(`The implementer is blocked: ${value.summary}`);
+      if (value.status === "blocked") throw new RelayBlocked(`The implementer is blocked: ${value.summary}`);
       return { status: "complete", summary: value.summary.trim() };
     },
   };
