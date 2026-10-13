@@ -93,7 +93,10 @@ async function chooseHarnesses() {
 function brief(result) {
   const text = result.summary || result.recommendations || result.findings
     || (result.decision && `${result.decision}`) || (result.tasks && `${result.tasks.length} task(s)`) || "";
-  return String(text).replace(/\s+/g, " ").slice(0, 200);
+  const skills = result.skillsUsed?.length ? `skills used: ${result.skillsUsed.join(", ")}`
+    : result.skillNote ? `skill note: ${result.skillNote}` : "no relevant skills used";
+  const skillText = result.skillsUsed !== undefined || result.skillNote !== undefined ? ` · ${skills}` : "";
+  return `${String(text).replace(/\s+/g, " ")}${skillText}`.slice(0, 240);
 }
 
 async function record(state, entry) {
@@ -460,7 +463,7 @@ async function runTask(state, index) {
       key: `impl-${index}-${round}`, ticket: { id: ticketId }, parent, index, total: tasks.length, task, findings, hasGit,
     }), {
       onStart: baton,
-      onDone: (result) => ticketNote(state, ticketId, `Implementation round ${round}: ${result.summary}`, "in progress"),
+      onDone: (result) => ticketNote(state, ticketId, `Implementation round ${round}: ${brief(result)}`, "in progress"),
     });
     const reviewKey = `review-${index}-${round}`;
     let diff = null;
@@ -477,7 +480,7 @@ async function runTask(state, index) {
     }), {
       onStart: baton,
       onDone: (result) => ticketNote(state, ticketId,
-        result.decision === "approve" ? "Reviewer approved." : `Reviewer requested changes: ${result.findings}`),
+        result.decision === "approve" ? `Reviewer approved. ${brief(result)}` : `Reviewer requested changes: ${brief(result)}`),
     });
     if (review.decision === "approve") accepted = true;
   }

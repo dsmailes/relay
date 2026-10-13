@@ -153,6 +153,8 @@ Rotation follows this order. Herdr must recognise the kind, and the program must
 
 Each step starts a fresh harness session, so Relay gives it everything it needs: the agreed brief, the task and acceptance criteria, the ticket history, and for reviewers the exact diff of that task. Reviewers see only that task's changes, not your other work. They come from snapshots taken before and after each task, without touching your index, branch or HEAD.
 
+Relay also tells each harness to read applicable project instructions, discover skills available to that harness, and invoke the relevant ones using its native skill mechanism. Skill availability can differ between harnesses; Relay does not install skills. For TCA work, prompts specifically direct harnesses to look for applicable Point-Free/pfw skills, such as Composable Architecture, dependencies, testing, SwiftUI, or navigation guidance. Implementers and reviewers report the skills they used (or any availability limitation) in their hand-off, which Relay records in the run history and Livestock ticket.
+
 A harness finishes each step with one **hand-off line** that Relay reads from its tab. Every prompt gets its own random token so old output is never mistaken for a new answer.
 
 | Step | Hand-off line |
@@ -162,8 +164,8 @@ A harness finishes each step with one **hand-off line** that Relay reads from it
 | Revised plan | `RELAY_REVISED_PLAN_<token>: {"tasks":[…]}` |
 | Design review | `RELAY_DESIGN_<token>: {"recommendations":…}` |
 | Second opinion | `RELAY_OPINION_<token>: {"decision":"approve"}` or `{"decision":"revise","findings":…}` |
-| Implementation | `RELAY_IMPLEMENTATION_<token>: {"status":"complete"\|"blocked","summary":…}` |
-| Review | `RELAY_REVIEW_<token>: {"decision":"approve"}` or `{"decision":"changes","findings":…}` |
+| Implementation | `RELAY_IMPLEMENTATION_<token>: {"status":"complete"\|"blocked","summary":…, "skillsUsed":[…], "skillNote":…}` |
+| Review | `RELAY_REVIEW_<token>: {"decision":"approve"}` or `{"decision":"changes","findings":…}`, with `skillsUsed` and `skillNote` |
 
 If a harness answers in the wrong shape, Relay says what was wrong and asks again, up to three times. A plan has 1 to 20 tasks, each with a `title` and `acceptanceCriteria`. Because later harnesses never see your conversation, the planner writes `request` as a self-contained brief, and the better that brief is, the better the later steps do.
 
